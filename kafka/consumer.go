@@ -23,9 +23,9 @@ const (
 
 const (
 	// OffsetNewest defines the newest offset to read from using the consumer
-	OffsetNewest = -1
+	OffsetNewest = sarama.OffsetNewest
 	// OffsetOldest defines the oldest offset to read from using the consumer
-	OffsetOldest = -2
+	OffsetOldest = sarama.OffsetOldest
 )
 
 // Consumer abstracts a kafka consumer
@@ -40,6 +40,9 @@ type Consumer interface {
 	// consume individual topic/partitions
 	AddPartition(topic string, partition int32, initialOffset int64) error
 	RemovePartition(topic string, partition int32) error
+
+	// LowWaterMark returns the oldest offset of a given partition of a given topic.
+	LowWaterMark(topic string, partition int32) (int64, error)
 
 	// Close stops closes the events channel
 	Close() error
@@ -91,6 +94,10 @@ func (c *saramaConsumer) Close() error {
 		errs.Collect(err)
 	}
 	return errs.NilOrError()
+}
+
+func (c *saramaConsumer) LowWaterMark(topic string, partition int32) (int64, error) {
+	return c.simpleConsumer.client.GetOffset(topic, partition, OffsetOldest)
 }
 
 func (c *saramaConsumer) Events() <-chan Event {

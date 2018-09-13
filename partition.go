@@ -46,7 +46,10 @@ type partition struct {
 	proxy   kafkaProxy
 	process processCallback
 
+	cleanerPolicy CleanerPolicy
+
 	recoveredFlag int32
+	lwm           int64
 	hwm           int64
 	offset        int64
 
@@ -61,16 +64,20 @@ type partition struct {
 type kafkaProxy interface {
 	Add(string, int64) error
 	Remove(string) error
+	LowWaterMark(topic string) (int64, error)
 	AddGroup()
 	Stop()
 }
 
 type processCallback func(msg *message, st storage.Storage, wg *sync.WaitGroup, pstats *PartitionStats) (int, error)
 
-func newPartition(log logger.Logger, topic string, cb processCallback, st *storageProxy, proxy kafkaProxy, channelSize int) *partition {
+func newPartition(log logger.Logger, topic string, cb processCallback, st *storageProxy, proxy kafkaProxy, channelSize int, cpol CleanerPolicy) *partition {
 	return &partition{
-		log:   log,
+		log: log,
+
 		topic: topic,
+
+		cleanerPolicy: cpol,
 
 		ch:      make(chan kafka.Event, channelSize),
 		st:      st,
@@ -141,8 +148,26 @@ func (p *partition) run(ctx context.Context) error {
 	p.proxy.AddGroup()
 	defer wg.Wait()
 
+	cleaner := NoCleaning(ctx)
+	if !p.st.Stateless() {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		cleaner = p.cleanerPolicy(ctx)
+	}
+
 	for {
 		select {
+		case cb, ok := <-cleaner:
+			if !ok {
+				cleaner = nil
+				continue
+			}
+
+			if err := p.clean(ctx); err != nil {
+				return fmt.Errorf("error cleaning: %v", err)
+			}
+
+			cb()
 		case ev, isOpen := <-p.ch:
 			// channel already closed, ev will be nil
 			if !isOpen {
@@ -191,7 +216,6 @@ func (p *partition) run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		}
-
 	}
 }
 
@@ -209,6 +233,28 @@ func (p *partition) recover(ctx context.Context) error {
 
 func (p *partition) recovered() bool {
 	return atomic.LoadInt32(&p.recoveredFlag) == 1
+}
+
+func (p *partition) clean(ctx context.Context) error {
+	lwm, err := p.proxy.LowWaterMark(p.topic)
+	if err != nil {
+		return err
+	}
+
+	began := time.Now()
+	deleted, err := p.st.DeleteUntil(ctx, lwm)
+	if err != nil {
+		return err
+	}
+	finished := time.Now()
+
+	p.lwm = lwm
+	p.stats.Table.Cleaner.Cycles++
+	p.stats.Table.Cleaner.LastDuration = finished.Sub(began)
+	p.stats.Table.Cleaner.LastTimestamp = finished
+	p.stats.Table.Cleaner.RecordsDeleted = p.stats.Table.Cleaner.RecordsDeleted + deleted
+
+	return nil
 }
 
 func (p *partition) load(ctx context.Context, catchup bool) (rerr error) {
@@ -234,11 +280,24 @@ func (p *partition) load(ctx context.Context, catchup bool) (rerr error) {
 	// reset stats after load
 	defer p.stats.reset()
 
+	cleaner := NoCleaning(ctx)
+	cleanerStarted := false
+
 	var lastMessage time.Time
 	for {
 		select {
-		case ev, isOpen := <-p.ch:
+		case cb, ok := <-cleaner:
+			if !ok {
+				cleaner = nil
+				continue
+			}
 
+			if err := p.clean(ctx); err != nil {
+				return fmt.Errorf("error cleaning: %v", err)
+			}
+
+			cb()
+		case ev, isOpen := <-p.ch:
 			// channel already closed, ev will be nil
 			if !isOpen {
 				return nil
@@ -264,10 +323,16 @@ func (p *partition) load(ctx context.Context, catchup bool) (rerr error) {
 				}
 
 				if catchup {
+					if !cleanerStarted {
+						cctx, cancel := context.WithCancel(ctx)
+						defer cancel()
+						cleaner = p.cleanerPolicy(cctx)
+						cleanerStarted = true
+					}
 					continue
 				}
-				return nil
 
+				return nil
 			case *kafka.Message:
 				lastMessage = time.Now()
 				if ev.Topic != p.topic {
@@ -322,7 +387,7 @@ func (p *partition) load(ctx context.Context, catchup bool) (rerr error) {
 }
 
 func (p *partition) storeEvent(msg *kafka.Message) error {
-	err := p.st.Update(msg.Key, msg.Value)
+	err := p.st.Update(msg.Key, msg.Value, msg.Offset)
 	if err != nil {
 		return fmt.Errorf("Error from the update callback while recovering from the log: %v", err)
 	}
@@ -330,6 +395,7 @@ func (p *partition) storeEvent(msg *kafka.Message) error {
 	if err != nil {
 		return fmt.Errorf("Error updating offset in local storage while recovering from the log: %v", err)
 	}
+
 	return nil
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/lovoo/goka/logger"
 	"github.com/lovoo/goka/mock"
 	"github.com/lovoo/goka/storage"
+	"github.com/lovoo/goka/storage/keyvalue/backend/simple"
 
 	"github.com/facebookgo/ensure"
 	"github.com/golang/mock/gomock"
@@ -26,8 +27,8 @@ func createTestView(t *testing.T, consumer kafka.Consumer, sb storage.Builder, t
 	opts := &voptions{
 		log:        logger.Default(),
 		tableCodec: new(codec.String),
-		updateCallback: func(s storage.Storage, partition int32, key string, value []byte) error {
-			if err := DefaultUpdate(s, partition, key, value); err != nil {
+		updateCallback: func(s storage.Storage, partition int32, key string, value []byte, offset int64) error {
+			if err := DefaultUpdate(s, partition, key, value, offset); err != nil {
 				return err
 			}
 			recoveredMessages++
@@ -451,8 +452,8 @@ func TestView_Evict(t *testing.T) {
 	key := "some-key"
 	val := "some-val"
 
-	st := storage.NewMemory()
-	err := st.Set(key, []byte(val))
+	st := simple.New()
+	err := st.Set(key, []byte(val), 1)
 	ensure.Nil(t, err)
 
 	v := &View{

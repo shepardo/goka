@@ -32,6 +32,10 @@ func (p *proxy) Remove(topic string) error {
 	return nil
 }
 
+func (p *proxy) LowWaterMark(topic string) (int64, error) {
+	return p.consumer.LowWaterMark(topic, p.partition)
+}
+
 func (p *proxy) AddGroup() {
 	p.consumer.AddGroupPartition(p.partition)
 }
@@ -109,8 +113,8 @@ func (s *storageProxy) Close() error {
 	return s.closedOnce.Do(s.Storage.Close)
 }
 
-func (s *storageProxy) Update(k string, v []byte) error {
-	return s.update(s.Storage, s.partition, k, v)
+func (s *storageProxy) Update(k string, v []byte, o int64) error {
+	return s.update(s.Storage, s.partition, k, v, o)
 }
 
 func (s *storageProxy) Stateless() bool {

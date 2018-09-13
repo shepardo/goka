@@ -1,9 +1,11 @@
 package tester
 
 import (
+	"context"
 	"fmt"
 	"hash"
 	"log"
+	"math"
 	"sync"
 
 	"github.com/facebookgo/ensure"
@@ -12,6 +14,7 @@ import (
 	"github.com/lovoo/goka/codec"
 	"github.com/lovoo/goka/kafka"
 	"github.com/lovoo/goka/storage"
+	"github.com/lovoo/goka/storage/keyvalue/backend/simple"
 )
 
 // Codec decodes and encodes from and to []byte
@@ -78,7 +81,7 @@ type T interface {
 //     )
 func New(t T) *Tester {
 	tester := &Tester{
-		storage:        storage.NewMemory(),
+		storage:        simple.New(),
 		t:              t,
 		incomingEvents: make(chan kafka.Event),
 		consumerEvents: make(chan kafka.Event),
@@ -242,10 +245,10 @@ func (km *Tester) ValueForKey(key string) interface{} {
 }
 
 // SetValue sets a value in the storage.
-func (km *Tester) SetValue(key string, value interface{}) {
+func (km *Tester) SetValue(key string, value interface{}, offset int64) {
 	data, err := km.codec.Encode(value)
 	ensure.Nil(km.t, err)
-	err = km.storage.Set(key, data)
+	err = km.storage.Set(key, data, offset)
 	ensure.Nil(km.t, err)
 }
 
@@ -349,9 +352,8 @@ func (km *Tester) makeCalls() {
 // ClearValues resets everything that might be in the storage by deleting everything
 // using the iterator.
 func (km *Tester) ClearValues() {
-	it, _ := km.storage.Iterator()
-	for it.Next() {
-		km.storage.Delete(string(it.Key()))
+	if _, err := km.storage.DeleteUntil(context.TODO(), math.MaxInt64); err != nil {
+		panic(err.Error())
 	}
 }
 
@@ -363,6 +365,10 @@ func newConsumerMock(tester *Tester) *consumerMock {
 	return &consumerMock{
 		tester: tester,
 	}
+}
+
+func (kcm *consumerMock) LowWaterMark(topic string, partition int32) (int64, error) {
+	return 0, nil
 }
 
 // Events returns the event channel of the consumer mock

@@ -6,7 +6,7 @@ import (
 
 	"github.com/facebookgo/ensure"
 	"github.com/lovoo/goka/codec"
-	"github.com/lovoo/goka/storage"
+	kvleveldb "github.com/lovoo/goka/storage/keyvalue/backend/leveldb"
 	"github.com/syndtr/goleveldb/leveldb"
 )
 
@@ -17,8 +17,9 @@ func TestIterator(t *testing.T) {
 	db, err := leveldb.OpenFile(tmpdir, nil)
 	ensure.Nil(t, err)
 
-	st, err := storage.New(db)
+	st, err := kvleveldb.New(db)
 	ensure.Nil(t, err)
+	ensure.Nil(t, st.MarkRecovered())
 
 	kv := map[string]string{
 		"key-1": "val-1",
@@ -27,16 +28,15 @@ func TestIterator(t *testing.T) {
 	}
 
 	for k, v := range kv {
-		ensure.Nil(t, st.Set(k, []byte(v)))
+		ensure.Nil(t, st.Set(k, []byte(v), 777))
 	}
 
 	ensure.Nil(t, st.SetOffset(777))
 
-	iter, err := st.Iterator()
-	ensure.Nil(t, err)
+	iter := st.Iterator(nil, nil)
 
 	it := &iterator{
-		iter:  storage.NewMultiIterator([]storage.Iterator{iter}),
+		iter:  iter,
 		codec: new(codec.String),
 	}
 	defer it.Release()

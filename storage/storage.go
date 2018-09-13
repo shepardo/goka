@@ -1,201 +1,78 @@
 package storage
 
-import (
-	"fmt"
-	"strconv"
+import "context"
 
-	"github.com/syndtr/goleveldb/leveldb"
-	ldbiter "github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/util"
-)
+// Builder creates a local storage (a persistent cache) for a topic
+// table. Builder creates one storage for each partition of the topic.
+type Builder func(topic string, partition int32) (Storage, error)
 
-const (
-	offsetKey = "__offset"
-)
-
-// Iterator provides iteration access to the stored values.
+// Iterator iterates over key-value pairs.
 type Iterator interface {
-	// Next advances the iterator to the next key.
+	// Next moves the iterator to the next pair and returns whether another pair
+	// exists.
 	Next() bool
-	// Key gets the current key. If the iterator is exhausted, key will return
-	// nil.
-	Key() []byte
-	// Value gets the current value.
-	Value() ([]byte, error)
-	// Release releases the iterator. After release, the iterator is not usable
-	// anymore.
+	// Error returns whether the iterator stopped due to an error
+	Error() error
+	// Release releases the iterator.
 	Release()
-	// Seek for a key in the iterator
-	Seek(key []byte) bool
+	// Key returns the current key.
+	Key() []byte
+	// Value returns the value associated with the key
+	Value() []byte
+	// Seek moves the iterator to the first key-value pair that is greater or equal
+	// to the given key. It returns whether such pair exists.
+	Seek([]byte) bool
 }
 
-// Storage abstracts the interface for a persistent local storage
+// ReadInterface contains the read only parts of a storage.
+type ReadInterface interface {
+	// Has returns whether the given key exists in the database.
+	Has(key string) (bool, error)
+	// Get returns the value associated with the given key. If the key does not
+	// exist, a nil will be returned.
+	Get(key string) ([]byte, error)
+
+	// Iterator returns a new iterator that iterates over the key-value
+	// pairs. Start and limit define a half-open range [start, limit]. If either
+	// is empty, the range will be unbounded on the respective side.
+	Iterator([]byte, []byte) Iterator
+
+	// GetOffset gets the local offset of the storage.
+	GetOffset(def int64) (int64, error)
+}
+
+// Snapshot is the interface of a storage snapshot.
+type Snapshot interface {
+	ReadInterface
+	// Release releases the snapshot and frees the associated resource.
+	Release()
+}
+
+// Storage is the interface Goka expects from a storage implementation.
+// Implementations of this interface must be safe for any number of concurrent
+// readers with one writer.
 type Storage interface {
-	Has(string) (bool, error)
-	Get(string) ([]byte, error)
-	Set(string, []byte) error
-	Delete(string) error
-	SetOffset(value int64) error
-	GetOffset(defValue int64) (int64, error)
-	Iterator() (Iterator, error)
-	IteratorWithRange(start, limit []byte) (Iterator, error)
+	ReadInterface
+	// Set stores a key-value pair.
+	Set(key string, val []byte, offset int64) error
+	// Delete deletes a key-value pair from the storage.
+	Delete(key string) error
+	// DeleteUntil deletes every key that corresponds to a lower offset than the
+	// one given.
+	DeleteUntil(ctx context.Context, offset int64) (int64, error)
+	// SetOffset sets the local offset of the storage.
+	SetOffset(offset int64) error
+
+	// Snapshot returns a snapshot of the storage's current state.
+	Snapshot() (Snapshot, error)
+
+	// MarkRecovered marks the storage as recovered. Recovery message throughput
+	// can be a lot higher than during normal operation. This can be used to switch
+	// to a different configuration after the recovery is done.
 	MarkRecovered() error
-	Recovered() bool
+
 	Open() error
+
+	// Close closes the storage.
 	Close() error
-}
-
-// store is the common interface between a transaction and db instance
-type store interface {
-	Has([]byte, *opt.ReadOptions) (bool, error)
-	Get([]byte, *opt.ReadOptions) ([]byte, error)
-	Put([]byte, []byte, *opt.WriteOptions) error
-	Delete([]byte, *opt.WriteOptions) error
-	NewIterator(*util.Range, *opt.ReadOptions) ldbiter.Iterator
-}
-
-type storage struct {
-	// store is the active store, either db or tx
-	store store
-	db    *leveldb.DB
-	// tx is the transaction used for recovery
-	tx *leveldb.Transaction
-
-	currentOffset int64
-}
-
-// New creates a new Storage backed by LevelDB.
-func New(db *leveldb.DB) (Storage, error) {
-	tx, err := db.OpenTransaction()
-	if err != nil {
-		return nil, fmt.Errorf("error opening leveldb transaction: %v", err)
-	}
-
-	return &storage{
-		store: tx,
-		db:    db,
-		tx:    tx,
-	}, nil
-}
-
-// Iterator returns an iterator that traverses over a snapshot of the storage.
-func (s *storage) Iterator() (Iterator, error) {
-	snap, err := s.db.GetSnapshot()
-	if err != nil {
-		return nil, err
-	}
-
-	return &iterator{
-		iter: s.store.NewIterator(nil, nil),
-		snap: snap,
-	}, nil
-}
-
-// Iterator returns an iterator that traverses over a snapshot of the storage.
-func (s *storage) IteratorWithRange(start, limit []byte) (Iterator, error) {
-	snap, err := s.db.GetSnapshot()
-	if err != nil {
-		return nil, err
-	}
-
-	if limit != nil && len(limit) > 0 {
-		return &iterator{
-			iter: s.store.NewIterator(&util.Range{Start: start, Limit: limit}, nil),
-			snap: snap,
-		}, nil
-	}
-	return &iterator{
-		iter: s.store.NewIterator(util.BytesPrefix(start), nil),
-		snap: snap,
-	}, nil
-
-}
-
-func (s *storage) Has(key string) (bool, error) {
-	return s.store.Has([]byte(key), nil)
-}
-
-func (s *storage) Get(key string) ([]byte, error) {
-	if has, err := s.store.Has([]byte(key), nil); err != nil {
-		return nil, fmt.Errorf("error checking for existence in leveldb (key %s): %v", key, err)
-	} else if !has {
-		return nil, nil
-	}
-
-	value, err := s.store.Get([]byte(key), nil)
-	if err == leveldb.ErrNotFound {
-		return nil, nil
-	} else if err != nil {
-		return nil, fmt.Errorf("error getting from leveldb (key %s): %v", key, err)
-	}
-	return value, nil
-}
-
-func (s *storage) GetOffset(defValue int64) (int64, error) {
-	data, err := s.Get(offsetKey)
-	if err != nil {
-		return 0, err
-	}
-
-	if data == nil {
-		return defValue, nil
-	}
-
-	value, err := strconv.ParseInt(string(data), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("error decoding offset: %v", err)
-	}
-
-	return value, nil
-}
-
-func (s *storage) Set(key string, value []byte) error {
-	if err := s.store.Put([]byte(key), value, nil); err != nil {
-		return fmt.Errorf("error setting to leveldb (key %s): %v", key, err)
-	}
-	return nil
-}
-
-func (s *storage) SetOffset(offset int64) error {
-	if offset > s.currentOffset {
-		s.currentOffset = offset
-	}
-
-	return s.Set(offsetKey, []byte(strconv.FormatInt(offset, 10)))
-}
-
-func (s *storage) Delete(key string) error {
-	if err := s.store.Delete([]byte(key), nil); err != nil {
-		return fmt.Errorf("error deleting from leveldb (key %s): %v", key, err)
-	}
-
-	return nil
-}
-
-func (s *storage) MarkRecovered() error {
-	if s.store == s.db {
-		return nil
-	}
-
-	s.store = s.db
-	return s.tx.Commit()
-}
-
-func (s *storage) Recovered() bool {
-	return s.store == s.db
-}
-
-func (s *storage) Open() error {
-	return nil
-}
-
-func (s *storage) Close() error {
-	if s.store == s.tx {
-		if err := s.tx.Commit(); err != nil {
-			return fmt.Errorf("error closing transaction: %v", err)
-		}
-	}
-
-	return s.db.Close()
 }

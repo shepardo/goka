@@ -256,7 +256,7 @@ func TestContext_Set(t *testing.T) {
 	}
 
 	gomock.InOrder(
-		storage.EXPECT().Set(key, []byte(value)).Return(nil),
+		storage.EXPECT().Set(key, []byte(value), offset).Return(nil),
 	)
 	ctx.emitter = newEmitter(nil, nil)
 
@@ -306,7 +306,7 @@ func TestContext_GetSetStateful(t *testing.T) {
 	val := ctx.Value()
 	ensure.True(t, val == nil)
 
-	storage.EXPECT().Set(key, []byte(value)).Return(nil)
+	storage.EXPECT().Set(key, []byte(value), offset).Return(nil)
 	ctx.SetValue(value)
 
 	storage.EXPECT().Get(key).Return([]byte(value), nil)
@@ -345,7 +345,7 @@ func TestContext_SetErrors(t *testing.T) {
 	ensure.NotNil(t, err)
 	ensure.StringContains(t, err.Error(), "error encoding")
 
-	storage.EXPECT().Set(key, []byte(value)).Return(fmt.Errorf("some error"))
+	storage.EXPECT().Set(key, []byte(value), offset).Return(fmt.Errorf("some error"))
 	err = ctx.setValueForKey(key, value)
 	ensure.NotNil(t, err)
 	ensure.StringContains(t, err.Error(), "error storing")
@@ -355,7 +355,7 @@ func TestContext_SetErrors(t *testing.T) {
 		ensure.NotNil(t, err)
 		ensure.StringContains(t, err.Error(), "error X")
 	})
-	storage.EXPECT().Set(key, []byte(value)).Return(nil)
+	storage.EXPECT().Set(key, []byte(value), offset).Return(nil)
 	err = ctx.setValueForKey(key, value)
 	ensure.Nil(t, err)
 }

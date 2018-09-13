@@ -210,6 +210,7 @@ func (c *groupConsumer) waitForMessages() bool {
 			case <-c.stop:
 				return false
 			}
+
 		case msg := <-c.consumer.Messages():
 			select {
 			case c.events <- &Message{

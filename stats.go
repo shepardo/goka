@@ -41,7 +41,15 @@ type PartitionStats struct {
 		Stalled bool
 
 		Offset int64 // last offset processed or recovered
+		Lwm    int64 // oldest offset stored
 		Hwm    int64 // next offset to be written
+
+		Cleaner struct {
+			Cycles         int64         // number of clean up cycles ran
+			LastDuration   time.Duration // duration of the last clean up
+			LastTimestamp  time.Time     // timestamp of the last clean up
+			RecordsDeleted int64         // total number of records deleted in all clean ups
+		}
 
 		StartTime    time.Time
 		RecoveryTime time.Time

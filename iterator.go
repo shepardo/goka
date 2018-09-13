@@ -30,10 +30,8 @@ func (i *iterator) Key() string {
 
 // Value returns the current value decoded by the codec of the storage.
 func (i *iterator) Value() (interface{}, error) {
-	data, err := i.iter.Value()
-	if err != nil {
-		return nil, err
-	} else if data == nil {
+	data := i.iter.Value()
+	if data == nil {
 		return nil, nil
 	}
 	return i.codec.Decode(data)

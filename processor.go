@@ -12,6 +12,8 @@ import (
 	"github.com/lovoo/goka/logger"
 	"github.com/lovoo/goka/multierr"
 	"github.com/lovoo/goka/storage"
+	"github.com/lovoo/goka/storage/keyvalue/backend/simple"
+	"github.com/lovoo/goka/storage/null"
 )
 
 // Processor is a set of stateful callback functions that, on the arrival of
@@ -62,7 +64,7 @@ func NewProcessor(brokers []string, gg *GroupGraph, options ...ProcessorOption) 
 			WithLogger(logger.Default()),
 			WithUpdateCallback(DefaultUpdate),
 			WithPartitionChannelSize(defaultPartitionChannelSize),
-			WithStorageBuilder(storage.DefaultBuilder(DefaultProcessorStoragePath(gg.Group()))),
+			WithStorageBuilder(simple.Builder),
 		},
 
 		// user-defined options (may overwrite default ones)
@@ -470,7 +472,7 @@ func (g *Processor) newJoinStorage(topic string, id int32, update UpdateCallback
 func (g *Processor) newStorage(topic string, id int32, update UpdateCallback) (*storageProxy, error) {
 	if g.isStateless() {
 		return &storageProxy{
-			Storage:   storage.NewMemory(),
+			Storage:   null.New(),
 			partition: id,
 			stateless: true,
 		}, nil
@@ -508,6 +510,7 @@ func (g *Processor) createPartitionViews(ctx context.Context, id int32) error {
 			t.Topic(),
 			nil, st, &proxy{id, g.consumer},
 			g.opts.partitionChannelSize,
+			g.opts.cleanerPolicy,
 		)
 		g.partitionViews[id][t.Topic()] = p
 
@@ -563,6 +566,7 @@ func (g *Processor) createPartition(ctx context.Context, id int32) error {
 		groupTable,
 		g.process, st, &delayProxy{proxy: proxy{partition: id, consumer: g.consumer}, wait: wait},
 		g.opts.partitionChannelSize,
+		g.opts.cleanerPolicy,
 	)
 	par := g.partitions[id]
 	g.errg.Go(func() (err error) {

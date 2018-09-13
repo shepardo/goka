@@ -11,6 +11,7 @@ import (
 	"github.com/lovoo/goka/logger"
 	"github.com/lovoo/goka/multierr"
 	"github.com/lovoo/goka/storage"
+	"github.com/lovoo/goka/storage/keyvalue/backend/simple"
 )
 
 // Getter functions return a value for a key or an error. If no value exists for the key, nil is returned without errors.
@@ -34,7 +35,7 @@ func NewView(brokers []string, topic Table, codec Codec, options ...ViewOption) 
 			WithViewLogger(logger.Default()),
 			WithViewCallback(DefaultUpdate),
 			WithViewPartitionChannelSize(defaultPartitionChannelSize),
-			WithViewStorageBuilder(storage.DefaultBuilder(DefaultViewStoragePath())),
+			WithViewStorageBuilder(simple.Builder),
 		},
 
 		// then the user passed options
@@ -99,6 +100,7 @@ func (v *View) createPartitions(brokers []string) (rerr error) {
 			&storageProxy{Storage: st, partition: p, update: v.opts.updateCallback},
 			&proxy{p, nil},
 			v.opts.partitionChannelSize,
+			v.opts.cleanerPolicy,
 		)
 		v.partitions = append(v.partitions, po)
 	}
@@ -272,46 +274,19 @@ func (v *View) Has(key string) (bool, error) {
 
 // Iterator returns an iterator that iterates over the state of the View.
 func (v *View) Iterator() (Iterator, error) {
-	iters := make([]storage.Iterator, 0, len(v.partitions))
-	for i := range v.partitions {
-		iter, err := v.partitions[i].st.Iterator()
-		if err != nil {
-			// release already opened iterators
-			for i := range iters {
-				iters[i].Release()
-			}
-
-			return nil, fmt.Errorf("error opening partition iterator: %v", err)
-		}
-
-		iters = append(iters, iter)
-	}
-
-	return &iterator{
-		iter:  storage.NewMultiIterator(iters),
-		codec: v.opts.tableCodec,
-	}, nil
+	return v.IteratorWithRange("", "")
 }
 
 // IteratorWithRange returns an iterator that iterates over the state of the View. This iterator is build using the range.
 func (v *View) IteratorWithRange(start, limit string) (Iterator, error) {
 	iters := make([]storage.Iterator, 0, len(v.partitions))
 	for i := range v.partitions {
-		iter, err := v.partitions[i].st.IteratorWithRange([]byte(start), []byte(limit))
-		if err != nil {
-			// release already opened iterators
-			for i := range iters {
-				iters[i].Release()
-			}
-
-			return nil, fmt.Errorf("error opening partition iterator: %v", err)
-		}
-
+		iter := v.partitions[i].st.Iterator([]byte(start), []byte(limit))
 		iters = append(iters, iter)
 	}
 
 	return &iterator{
-		iter:  storage.NewMultiIterator(iters),
+		iter:  storage.MergeIterator(iters),
 		codec: v.opts.tableCodec,
 	}, nil
 }

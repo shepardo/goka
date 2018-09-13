@@ -13,7 +13,7 @@ import (
 
 // UpdateCallback is invoked upon arrival of a message for a table partition.
 // The partition storage shall be updated in the callback.
-type UpdateCallback func(s storage.Storage, partition int32, key string, value []byte) error
+type UpdateCallback func(s storage.Storage, partition int32, key string, value []byte, offset int64) error
 
 ///////////////////////////////////////////////////////////////////////////////
 // default values
@@ -40,12 +40,16 @@ func DefaultViewStoragePath() string {
 // during recovery of processors and during the normal operation of views.
 // DefaultUpdate can be used in the function passed to WithUpdateCallback and
 // WithViewCallback.
-func DefaultUpdate(s storage.Storage, partition int32, key string, value []byte) error {
+func DefaultUpdate(s storage.Storage, partition int32, key string, value []byte, offset int64) error {
 	if value == nil {
 		return s.Delete(key)
 	}
 
-	return s.Set(key, value)
+	return s.Set(key, value, offset)
+}
+
+func DefaultCleanerPolicy() CleanerPolicy {
+	return NoCleaning
 }
 
 // DefaultHasher returns an FNV hasher builder to assign keys to partitions.
@@ -72,6 +76,7 @@ type poptions struct {
 	partitionChannelSize int
 	hasher               func() hash.Hash32
 	nilHandling          NilHandling
+	cleanerPolicy        CleanerPolicy
 
 	builders struct {
 		storage  storage.Builder
@@ -148,6 +153,12 @@ func WithHasher(hasher func() hash.Hash32) ProcessorOption {
 	}
 }
 
+func WithCleanerPolicy(cup CleanerPolicy) ProcessorOption {
+	return func(o *poptions) {
+		o.cleanerPolicy = cup
+	}
+}
+
 // NilHandling defines how nil messages should be handled by the processor.
 type NilHandling int
 
@@ -191,6 +202,7 @@ func (opt *poptions) applyOptions(group string, opts ...ProcessorOption) error {
 	opt.clientID = defaultClientID
 	opt.log = logger.Default()
 	opt.hasher = DefaultHasher()
+	opt.cleanerPolicy = DefaultCleanerPolicy()
 
 	for _, o := range opts {
 		o(opt)
@@ -228,6 +240,7 @@ type voptions struct {
 	partitionChannelSize int
 	hasher               func() hash.Hash32
 	restartable          bool
+	cleanerPolicy        CleanerPolicy
 
 	builders struct {
 		storage  storage.Builder
@@ -305,10 +318,17 @@ func WithViewRestartable() ViewOption {
 	}
 }
 
+func WithViewCleanerPolicy(cup CleanerPolicy) ViewOption {
+	return func(o *voptions) {
+		o.cleanerPolicy = cup
+	}
+}
+
 func (opt *voptions) applyOptions(topic Table, opts ...ViewOption) error {
 	opt.clientID = defaultClientID
 	opt.log = logger.Default()
 	opt.hasher = DefaultHasher()
+	opt.cleanerPolicy = DefaultCleanerPolicy()
 
 	for _, o := range opts {
 		o(opt)

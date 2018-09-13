@@ -13,6 +13,8 @@ import (
 	"github.com/lovoo/goka/logger"
 	"github.com/lovoo/goka/mock"
 	"github.com/lovoo/goka/storage"
+	"github.com/lovoo/goka/storage/keyvalue/backend/simple"
+	"github.com/lovoo/goka/storage/null"
 
 	"github.com/facebookgo/ensure"
 	"github.com/golang/mock/gomock"
@@ -33,7 +35,7 @@ func newStorageProxy(st storage.Storage, id int32, update UpdateCallback) *stora
 
 func newNullStorageProxy(id int32) *storageProxy {
 	return &storageProxy{
-		Storage:   storage.NewMemory(),
+		Storage:   simple.New(),
 		partition: id,
 		stateless: true,
 	}
@@ -42,7 +44,7 @@ func newNullStorageProxy(id int32) *storageProxy {
 func TestNewPartition(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	p := newPartition(logger.Default(), topic, nil, nil, nil, defaultPartitionChannelSize)
+	p := newPartition(logger.Default(), topic, nil, nil, nil, defaultPartitionChannelSize, NoCleaning)
 	ensure.True(t, p != nil)
 }
 
@@ -56,7 +58,7 @@ func TestPartition_startStateless(t *testing.T) {
 		ctx, cancel = context.WithCancel(context.Background())
 	)
 
-	p := newPartition(logger.Default(), topic, nil, newNullStorageProxy(0), proxy, defaultPartitionChannelSize)
+	p := newPartition(logger.Default(), topic, nil, newNullStorageProxy(0), proxy, defaultPartitionChannelSize, NoCleaning)
 	proxy.EXPECT().AddGroup().Do(func() { close(wait) })
 	proxy.EXPECT().Stop()
 
@@ -86,7 +88,7 @@ func TestPartition_startStateful(t *testing.T) {
 		ctx, cancel = context.WithCancel(context.Background())
 	)
 
-	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, nil), proxy, defaultPartitionChannelSize)
+	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, nil), proxy, defaultPartitionChannelSize, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(offset, nil),
@@ -132,7 +134,7 @@ func TestPartition_runStateless(t *testing.T) {
 		return 0, nil
 	}
 
-	p := newPartition(logger.Default(), topic, consume, newNullStorageProxy(0), proxy, defaultPartitionChannelSize)
+	p := newPartition(logger.Default(), topic, consume, newNullStorageProxy(0), proxy, defaultPartitionChannelSize, NoCleaning)
 
 	proxy.EXPECT().AddGroup()
 	proxy.EXPECT().Stop()
@@ -182,7 +184,7 @@ func TestPartition_runStatelessWithError(t *testing.T) {
 		return 0, nil
 	}
 
-	p := newPartition(logger.Default(), topic, consume, newNullStorageProxy(0), proxy, defaultPartitionChannelSize)
+	p := newPartition(logger.Default(), topic, consume, newNullStorageProxy(0), proxy, defaultPartitionChannelSize, NoCleaning)
 
 	proxy.EXPECT().AddGroup()
 	proxy.EXPECT().Stop()
@@ -208,7 +210,7 @@ func TestPartition_runStatelessWithError(t *testing.T) {
 	ensure.Nil(t, err)
 
 	// test sending error into the channel
-	p = newPartition(logger.Default(), topic, consume, newNullStorageProxy(0), proxy, defaultPartitionChannelSize)
+	p = newPartition(logger.Default(), topic, consume, newNullStorageProxy(0), proxy, defaultPartitionChannelSize, NoCleaning)
 	wait = make(chan bool)
 
 	proxy.EXPECT().AddGroup()
@@ -254,7 +256,7 @@ func TestPartition_runStateful(t *testing.T) {
 		return 0, nil
 	}
 
-	p := newPartition(logger.Default(), topic, consume, newStorageProxy(st, 0, nil), proxy, 0)
+	p := newPartition(logger.Default(), topic, consume, newStorageProxy(st, 0, nil), proxy, 0, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
@@ -308,6 +310,133 @@ func TestPartition_runStateful(t *testing.T) {
 	ensure.Nil(t, err)
 }
 
+func TestPartition_cleanView(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	proxy := mock.NewMockkafkaProxy(ctrl)
+	st := mock.NewMockStorage(ctrl)
+
+	cleaner := make(chan CleanerCallback)
+
+	p := partition{
+		ch:    make(chan kafka.Event),
+		topic: "test-table",
+		proxy: proxy,
+		st:    newStorageProxy(st, 0, nil),
+		stats: &PartitionStats{},
+		cleanerPolicy: func(ctx context.Context) <-chan CleanerCallback {
+			return cleaner
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	gomock.InOrder(
+		st.EXPECT().GetOffset(int64(-2)).Return(int64(0), nil),
+		proxy.EXPECT().Add("test-table", int64(0)),
+		proxy.EXPECT().Remove("test-table").Return(nil),
+		st.EXPECT().MarkRecovered().Return(nil),
+		proxy.EXPECT().Add("test-table", int64(1)),
+		proxy.EXPECT().LowWaterMark("test-table").Return(int64(10), nil),
+		st.EXPECT().DeleteUntil(ctx, int64(10)).Return(int64(10), nil),
+		proxy.EXPECT().Remove("test-table").Return(nil),
+	)
+
+	go func() {
+		p.ch <- &kafka.EOF{Hwm: 1}
+
+		timeout := time.NewTimer(time.Second)
+		select {
+		case cleaner <- func() { cancel() }:
+			timeout.Stop()
+		case <-timeout.C:
+			cancel()
+			t.Fatalf("expected cleaner callback to be called")
+		}
+	}()
+
+	if err := p.catchup(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPartition_cleanStatelessProcessor(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	proxy := mock.NewMockkafkaProxy(ctrl)
+
+	p := partition{
+		topic: "test-table",
+		proxy: proxy,
+		st:    newStorageProxy(nil, 0, nil),
+		cleanerPolicy: func(ctx context.Context) <-chan CleanerCallback {
+			t.Fatalf("expected cleaner not be started in a stateless partition")
+			return nil
+		},
+	}
+
+	p.st.stateless = true
+
+	gomock.InOrder(
+		proxy.EXPECT().AddGroup(),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := p.run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPartition_cleanProcessor(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cleaner := make(chan CleanerCallback, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cleaner <- func() {
+		cancel()
+	}
+
+	proxy := mock.NewMockkafkaProxy(ctrl)
+	st := mock.NewMockStorage(ctrl)
+
+	p := partition{
+		topic: "test-table",
+		cleanerPolicy: func(ctx context.Context) <-chan CleanerCallback {
+			return cleaner
+		},
+
+		proxy: proxy,
+		st:    newStorageProxy(st, 0, nil),
+		stats: &PartitionStats{},
+	}
+
+	gomock.InOrder(
+		proxy.EXPECT().AddGroup(),
+		proxy.EXPECT().LowWaterMark("test-table").Return(int64(10), nil),
+		st.EXPECT().DeleteUntil(ctx, int64(10)).Return(int64(10), nil),
+	)
+
+	go func() {
+		timeout := time.NewTimer(time.Second)
+		select {
+		case <-timeout.C:
+			t.Fatalf("expected cleaner callback to be called but timedout")
+		case <-ctx.Done():
+			timeout.Stop()
+		}
+	}()
+
+	if err := p.run(ctx); err != nil && err != context.Canceled {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestPartition_runStatefulWithError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -335,7 +464,7 @@ func TestPartition_runStatefulWithError(t *testing.T) {
 		return 0, nil
 	}
 
-	p := newPartition(logger.Default(), topic, consume, newStorageProxy(st, 0, nil), proxy, defaultPartitionChannelSize)
+	p := newPartition(logger.Default(), topic, consume, newStorageProxy(st, 0, nil), proxy, defaultPartitionChannelSize, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
@@ -411,12 +540,12 @@ func TestPartition_loadStateful(t *testing.T) {
 		return 0, nil
 	}
 
-	p := newPartition(logger.Default(), topic, consume, newStorageProxy(st, 0, DefaultUpdate), proxy, defaultPartitionChannelSize)
+	p := newPartition(logger.Default(), topic, consume, newStorageProxy(st, 0, DefaultUpdate), proxy, defaultPartitionChannelSize, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
 		proxy.EXPECT().Add(topic, offset),
-		st.EXPECT().Set(key, value),
+		st.EXPECT().Set(key, value, offset),
 		st.EXPECT().SetOffset(int64(offset)).Return(nil),
 		st.EXPECT().MarkRecovered(),
 		proxy.EXPECT().Remove(topic),
@@ -486,12 +615,12 @@ func TestPartition_loadStatefulWithError(t *testing.T) {
 	)
 
 	// error in update
-	update := func(st storage.Storage, p int32, k string, v []byte) error {
+	update := func(st storage.Storage, p int32, k string, v []byte, o int64) error {
 		atomic.AddInt64(&count, 1)
 		return errors.New("some error")
 	}
 
-	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), proxy, 0)
+	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), proxy, 0, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
@@ -522,12 +651,12 @@ func TestPartition_loadStatefulWithError(t *testing.T) {
 
 	// error in SetOffset
 	wait = make(chan bool)
-	p = newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, DefaultUpdate), proxy, 0)
+	p = newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, DefaultUpdate), proxy, 0, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
 		proxy.EXPECT().Add(topic, offset),
-		st.EXPECT().Set(key, value),
+		st.EXPECT().Set(key, value, offset),
 		st.EXPECT().SetOffset(int64(offset)).Return(errors.New("some error")),
 		proxy.EXPECT().Remove(topic),
 		proxy.EXPECT().Stop(),
@@ -555,7 +684,7 @@ func TestPartition_loadStatefulWithError(t *testing.T) {
 
 	// error in GetOffset
 	wait = make(chan bool)
-	p = newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, nil), proxy, 0)
+	p = newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, nil), proxy, 0, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(0), errors.New("some error")),
@@ -592,7 +721,7 @@ func TestPartition_loadStatefulWithErrorAddRemovePartition(t *testing.T) {
 
 	// error in AddPartitionError
 	wait = make(chan bool)
-	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, DefaultUpdate), proxy, 0)
+	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, DefaultUpdate), proxy, 0, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
@@ -609,13 +738,13 @@ func TestPartition_loadStatefulWithErrorAddRemovePartition(t *testing.T) {
 	ensure.Nil(t, doTimed(t, func() { <-wait }))
 
 	// error in RemovePartition
-	update := func(st storage.Storage, p int32, k string, v []byte) error {
+	update := func(st storage.Storage, p int32, k string, v []byte, o int64) error {
 		atomic.AddInt64(&count, 1)
 		return errors.New("some error")
 	}
 
 	wait = make(chan bool)
-	p = newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), proxy, 0)
+	p = newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), proxy, 0, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
@@ -666,24 +795,24 @@ func TestPartition_catchupStateful(t *testing.T) {
 		count       int64
 	)
 
-	update := func(st storage.Storage, p int32, k string, v []byte) error {
+	update := func(st storage.Storage, p int32, k string, v []byte, o int64) error {
 		atomic.AddInt64(&count, 1)
 		step <- true
-		return DefaultUpdate(st, p, k, v)
+		return DefaultUpdate(st, p, k, v, o)
 	}
-	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), proxy, 0)
+	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), proxy, 0, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
 		proxy.EXPECT().Add(topic, offset),
-		st.EXPECT().Set(key, value),
+		st.EXPECT().Set(key, value, offset),
 		st.EXPECT().SetOffset(offset).Return(nil),
-		st.EXPECT().Set(key, value),
+		st.EXPECT().Set(key, value, offset+1),
 		st.EXPECT().SetOffset(offset+1).Return(nil),
 		proxy.EXPECT().Remove(topic),
 		st.EXPECT().MarkRecovered(),
 		proxy.EXPECT().Add(topic, offset+2),
-		st.EXPECT().Set(key, value),
+		st.EXPECT().Set(key, value, offset+2),
 		st.EXPECT().SetOffset(offset+2).Return(nil),
 		proxy.EXPECT().Remove(topic),
 		proxy.EXPECT().Stop(),
@@ -754,6 +883,7 @@ func TestPartition_catchupStateful(t *testing.T) {
 		Key:       key,
 		Value:     value,
 	}
+
 	err = sync()
 	ensure.Nil(t, err)
 	p.ch <- new(kafka.NOP)
@@ -783,19 +913,19 @@ func TestPartition_catchupStatefulWithError(t *testing.T) {
 		count  int64
 	)
 
-	update := func(st storage.Storage, p int32, k string, v []byte) error {
+	update := func(st storage.Storage, p int32, k string, v []byte, o int64) error {
 		atomic.AddInt64(&count, 1)
 		step <- true
-		return DefaultUpdate(st, p, k, v)
+		return DefaultUpdate(st, p, k, v, o)
 	}
-	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), proxy, 0)
+	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), proxy, 0, NoCleaning)
 
 	gomock.InOrder(
 		st.EXPECT().GetOffset(int64(-2)).Return(int64(offset), nil),
 		proxy.EXPECT().Add(topic, offset),
-		st.EXPECT().Set(key, value),
+		st.EXPECT().Set(key, value, offset),
 		st.EXPECT().SetOffset(offset).Return(nil),
-		st.EXPECT().Set(key, value),
+		st.EXPECT().Set(key, value, offset+1),
 		st.EXPECT().SetOffset(offset+1).Return(nil),
 		proxy.EXPECT().Remove(topic),
 		st.EXPECT().MarkRecovered(),
@@ -884,13 +1014,13 @@ func BenchmarkPartition_load(b *testing.B) {
 		offset int64 = 4
 		value        = []byte("value")
 		wait         = make(chan bool)
-		st           = storage.NewNull()
+		st           = null.New()
 	)
 
-	update := func(st storage.Storage, p int32, k string, v []byte) error {
+	update := func(st storage.Storage, p int32, k string, v []byte, o int64) error {
 		return nil
 	}
-	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), new(nullProxy), 0)
+	p := newPartition(logger.Default(), topic, nil, newStorageProxy(st, 0, update), new(nullProxy), 0, NoCleaning)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		err := p.start(ctx)

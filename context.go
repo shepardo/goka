@@ -281,7 +281,7 @@ func (ctx *cbContext) setValueForKey(key string, value interface{}) error {
 	}
 
 	ctx.counters.stores++
-	if err = ctx.storage.Set(key, encodedValue); err != nil {
+	if err = ctx.storage.Set(key, encodedValue, ctx.Offset()); err != nil {
 		return fmt.Errorf("error storing value: %v", err)
 	}
 

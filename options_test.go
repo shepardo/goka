@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/facebookgo/ensure"
+	"github.com/lovoo/goka/storage/null"
 )
 
 func newMockOptions(t *testing.T) *poptions {
@@ -13,7 +14,7 @@ func newMockOptions(t *testing.T) *poptions {
 	err := opts.applyOptions("")
 	ensure.Err(t, err, regexp.MustCompile("StorageBuilder not set$"))
 
-	opts.builders.storage = nullStorageBuilder()
+	opts.builders.storage = null.Builder
 	err = opts.applyOptions("")
 	ensure.Nil(t, err)
 

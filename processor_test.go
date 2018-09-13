@@ -20,6 +20,8 @@ import (
 	"github.com/lovoo/goka/mock"
 	"github.com/lovoo/goka/multierr"
 	"github.com/lovoo/goka/storage"
+	"github.com/lovoo/goka/storage/keyvalue/backend/simple"
+	"github.com/lovoo/goka/storage/null"
 	"github.com/lovoo/goka/tester"
 
 	"github.com/facebookgo/ensure"
@@ -29,12 +31,6 @@ import (
 var (
 	rawCodec = new(codec.Bytes)
 )
-
-func nullStorageBuilder() storage.Builder {
-	return func(topic string, partition int32) (storage.Storage, error) {
-		return &storage.Null{}, nil
-	}
-}
 
 func syncWith(t *testing.T, ch chan kafka.Event, p ...int32) error {
 	return doTimed(t, func() {
@@ -278,7 +274,7 @@ func TestProcessor_process(t *testing.T) {
 	// store something
 	promise = new(kafka.Promise)
 	gomock.InOrder(
-		st.EXPECT().Set("key", []byte("message")),
+		st.EXPECT().Set("key", []byte("message"), int64(123)),
 		producer.EXPECT().Emit(tableName(group), "key", []byte("message")).Return(promise),
 		st.EXPECT().GetOffset(int64(0)).Return(int64(321), nil),
 		st.EXPECT().SetOffset(int64(322)),
@@ -297,9 +293,9 @@ func TestProcessor_process(t *testing.T) {
 	promise = new(kafka.Promise)
 	promise2 := new(kafka.Promise)
 	gomock.InOrder(
-		st.EXPECT().Set("key", []byte("message")),
+		st.EXPECT().Set("key", []byte("message"), int64(123)),
 		producer.EXPECT().Emit(tableName(group), "key", []byte("message")).Return(promise),
-		st.EXPECT().Set("key", []byte("message2")),
+		st.EXPECT().Set("key", []byte("message2"), int64(123)),
 		producer.EXPECT().Emit(tableName(group), "key", []byte("message2")).Return(promise2),
 		st.EXPECT().GetOffset(int64(0)).Return(int64(321), nil),
 		st.EXPECT().SetOffset(int64(323)),
@@ -355,7 +351,7 @@ func TestProcessor_processFail(t *testing.T) {
 	p := newProcessor()
 	promise := new(kafka.Promise)
 	gomock.InOrder(
-		st.EXPECT().Set("key", []byte("message")),
+		st.EXPECT().Set("key", []byte("message"), int64(123)),
 		producer.EXPECT().Emit(tableName(group), "key", []byte("message")).Return(promise),
 		st.EXPECT().GetOffset(int64(0)).Return(int64(321), errors.New("getOffset failed")),
 	)
@@ -376,7 +372,7 @@ func TestProcessor_processFail(t *testing.T) {
 	promise = new(kafka.Promise)
 	p = newProcessor()
 	gomock.InOrder(
-		st.EXPECT().Set("key", []byte("message")),
+		st.EXPECT().Set("key", []byte("message"), int64(123)),
 		producer.EXPECT().Emit(tableName(group), "key", []byte("message")).Return(promise),
 		st.EXPECT().GetOffset(int64(0)).Return(int64(321), nil),
 		st.EXPECT().SetOffset(int64(322)).Return(errors.New("setOffset failed")),
@@ -398,7 +394,7 @@ func TestProcessor_processFail(t *testing.T) {
 	promise = new(kafka.Promise)
 	p = newProcessor()
 	gomock.InOrder(
-		st.EXPECT().Set("key", []byte("message")),
+		st.EXPECT().Set("key", []byte("message"), int64(123)),
 		producer.EXPECT().Emit(tableName(group), "key", []byte("message")).Return(promise),
 		st.EXPECT().GetOffset(int64(0)).Return(int64(321), nil),
 		st.EXPECT().SetOffset(int64(322)),
@@ -539,7 +535,7 @@ func TestNewProcessor(t *testing.T) {
 			Persist(rawCodec),
 		),
 		WithTopicManagerBuilder(createTopicManagerBuilder(tm)),
-		WithStorageBuilder(storage.MemoryBuilder()),
+		WithStorageBuilder(simple.Builder),
 	)
 	ensure.NotNil(t, err)
 
@@ -553,7 +549,7 @@ func TestNewProcessor(t *testing.T) {
 			Input(topic, rawCodec, cb),
 			Lookup(table, rawCodec)),
 		WithTopicManagerBuilder(createTopicManagerBuilder(tm)),
-		WithStorageBuilder(storage.MemoryBuilder()),
+		WithStorageBuilder(simple.Builder),
 	)
 	ensure.NotNil(t, err)
 
@@ -571,7 +567,7 @@ func TestNewProcessor(t *testing.T) {
 			Persist(rawCodec),
 		),
 		WithTopicManagerBuilder(createTopicManagerBuilder(tm)),
-		WithStorageBuilder(storage.MemoryBuilder()),
+		WithStorageBuilder(simple.Builder),
 	)
 	ensure.Nil(t, err)
 	ensure.DeepEqual(t, p.graph.GroupTable().Topic(), tableName(group))
@@ -614,7 +610,7 @@ func TestNewProcessor(t *testing.T) {
 		WithTopicManagerBuilder(createTopicManagerBuilder(tm)),
 		WithConsumerBuilder(createConsumerBuilder(consumer)),
 		WithProducerBuilder(createProducerBuilder(producer)),
-		WithStorageBuilder(storage.MemoryBuilder()),
+		WithStorageBuilder(simple.Builder),
 	)
 	ensure.Nil(t, err)
 	ensure.True(t, p.graph.GroupTable() == nil)
@@ -633,7 +629,7 @@ func TestProcessor_StartFails(t *testing.T) {
 
 	// error creating consumer
 	done := make(chan bool)
-	p := createProcessor(t, ctrl, consumer, 2, nullStorageBuilder())
+	p := createProcessor(t, ctrl, consumer, 2, null.Builder)
 	p.opts.builders.consumer = createFailedConsumerBuilder()
 	go func() {
 		errs := p.Run(context.Background())
@@ -645,7 +641,7 @@ func TestProcessor_StartFails(t *testing.T) {
 
 	// error creating producer and closing consumer
 	done = make(chan bool)
-	p = createProcessor(t, ctrl, consumer, 2, nullStorageBuilder())
+	p = createProcessor(t, ctrl, consumer, 2, null.Builder)
 	p.opts.builders.producer = createFailedProducerBuilder()
 	consumer.EXPECT().Close().Return(errSome)
 	go func() {
@@ -687,7 +683,7 @@ func TestProcessor_StartFails(t *testing.T) {
 
 	// error subscribing topics
 	done = make(chan bool)
-	p = createProcessor(t, ctrl, consumer, 2, nullStorageBuilder())
+	p = createProcessor(t, ctrl, consumer, 2, null.Builder)
 	consumer.EXPECT().Subscribe(topOff).Return(errSome)
 	consumer.EXPECT().Close().Return(nil)
 	go func() {
@@ -709,7 +705,7 @@ func TestProcessor_StartStopEmpty(t *testing.T) {
 		wait     = make(chan bool)
 		final    = make(chan bool)
 		ch       = make(chan kafka.Event)
-		p        = createProcessor(t, ctrl, consumer, 2, nullStorageBuilder())
+		p        = createProcessor(t, ctrl, consumer, 2, null.Builder)
 	)
 
 	consumer.EXPECT().Subscribe(topOff).Return(nil)
@@ -739,7 +735,7 @@ func TestProcessor_StartStopEmptyError(t *testing.T) {
 		final    = make(chan bool)
 		wait     = make(chan bool)
 		ch       = make(chan kafka.Event)
-		p        = createProcessor(t, ctrl, consumer, 2, nullStorageBuilder())
+		p        = createProcessor(t, ctrl, consumer, 2, null.Builder)
 	)
 
 	consumer.EXPECT().Subscribe(topOff).Return(nil)
@@ -842,7 +838,7 @@ func TestProcessor_StartWithErrorAfterRebalance(t *testing.T) {
 	consumer.EXPECT().AddPartition(tableName(group), int32(2), int64(123))
 	// 3. message
 	gomock.InOrder(
-		st.EXPECT().Set("key", value).Return(nil),
+		st.EXPECT().Set("key", value, int64(1)).Return(nil),
 		st.EXPECT().SetOffset(int64(1)),
 		st.EXPECT().MarkRecovered(),
 	)
@@ -1035,7 +1031,7 @@ func TestProcessor_Start(t *testing.T) {
 	consumer.EXPECT().AddPartition(tableName(group), int32(1), int64(123))
 	consumer.EXPECT().AddPartition(tableName(group), int32(2), int64(123))
 	// 3. load message partition 1
-	st.EXPECT().Set("key", value).Return(nil)
+	st.EXPECT().Set("key", value, int64(1)).Return(nil)
 	st.EXPECT().SetOffset(int64(1))
 	st.EXPECT().MarkRecovered()
 	// 4. end of recovery partition 1
@@ -1189,7 +1185,7 @@ func TestProcessor_StartWithTable(t *testing.T) {
 	consumer.EXPECT().AddPartition(table, int32(1), int64(123)).Times(2)
 	consumer.EXPECT().AddPartition(table, int32(2), int64(123))
 	// 3. message to group table
-	st.EXPECT().Set("key", value).Return(nil)
+	st.EXPECT().Set("key", value, int64(1)).Return(nil)
 	st.EXPECT().SetOffset(int64(1))
 	st.EXPECT().MarkRecovered()
 	// 4. finish recovery of partition 1
@@ -1758,7 +1754,7 @@ func TestProcessor_failOnRecover(t *testing.T) {
 			Persist(rawCodec),
 		),
 		WithTester(tester),
-		WithUpdateCallback(func(s storage.Storage, partition int32, key string, value []byte) error {
+		WithUpdateCallback(func(s storage.Storage, partition int32, key string, value []byte, offset int64) error {
 			log.Printf("recovered state: %s: %s", key, string(value))
 			return nil
 		}),
