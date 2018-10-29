@@ -7,13 +7,13 @@ import (
 	"github.com/benbjohnson/clock"
 )
 
-// CleanerCallback is a function that will be called after the clean up has
-// finished.
+// CleanerCallback is a function that will be called to signal cleanning
+// finishing.
 type CleanerCallback func()
 
 // CleanerPolicy decides when clean up should be performed on the local cache.
 // It signals a clean up by sending a CleanerCallback down the channel.
-// CleanerPolicy is called once per processor partition and should free its
+// CleanerPolicy is called once per topic/partition and should free its
 // resources once the context is canceled.
 type CleanerPolicy func(context.Context) <-chan CleanerCallback
 
@@ -23,7 +23,7 @@ func NoCleaning(ctx context.Context) <-chan CleanerCallback { return nil }
 // PeriodicCleaning returns a CleanerPolicy that will periodically clean up the
 // the local cache. It adjusts for slow clean ups by only signaling the next
 // clean up after the specified duration since last clean up has passed. First
-// clean up will be ran after the specified duration has passed.
+// clean up will be run after the specified duration has passed.
 func PeriodicCleaning(d time.Duration) CleanerPolicy {
 	return periodicCleaning(d, clock.New())
 }

@@ -1,11 +1,9 @@
 package tester
 
 import (
-	"context"
 	"fmt"
 	"hash"
 	"log"
-	"math"
 	"sync"
 
 	"github.com/facebookgo/ensure"
@@ -352,8 +350,9 @@ func (km *Tester) makeCalls() {
 // ClearValues resets everything that might be in the storage by deleting everything
 // using the iterator.
 func (km *Tester) ClearValues() {
-	if _, err := km.storage.DeleteUntil(context.TODO(), math.MaxInt64); err != nil {
-		panic(err.Error())
+	it := km.storage.Iterator(nil, nil)
+	for it.Next() {
+		km.storage.Delete(string(it.Key()))
 	}
 }
 

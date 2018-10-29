@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/lovoo/goka/storage"
 	"github.com/lovoo/goka/storage/keyvalue/backend"
 )
 
@@ -111,18 +110,6 @@ func (s *Storage) Delete(key string) error {
 	}
 
 	return b.Flush()
-}
-
-func (s *Storage) Snapshot() (storage.Snapshot, error) {
-	snap, err := s.store.Snapshot()
-	if err != nil {
-		return nil, err
-	}
-
-	return &Snapshot{
-		reader:   reader{snap},
-		snapshot: snap,
-	}, nil
 }
 
 func (s *Storage) MarkRecovered() error {

@@ -2,10 +2,13 @@ package leveldb
 
 import (
 	"testing"
+
+	"github.com/lovoo/goka/storage"
+	"github.com/lovoo/goka/storage/storagetest"
 )
 
-func TestKVLevelDB(t *testing.T) {
-	/*storagetest.Suite(t, func(t *testing.T) (storage.Storage, storagetest.TeardownFunc) {
+func TestCleanableLevelDB(t *testing.T) {
+	storagetest.Suite(t, func(t *testing.T) (storage.Storage, storagetest.TeardownFunc) {
 		tmp, teardown := storagetest.TempDir(t, "", "")
 		st, err := Builder(tmp)("test-topic", 0)
 		if err != nil {
@@ -13,5 +16,5 @@ func TestKVLevelDB(t *testing.T) {
 		}
 
 		return st, teardown
-	})*/
+	})
 }

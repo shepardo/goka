@@ -97,6 +97,7 @@ func NewProcessor(brokers []string, gg *GroupGraph, options ...ProcessorOption) 
 			WithViewTopicManagerBuilder(opts.builders.topicmgr),
 			WithViewStorageBuilder(opts.builders.storage),
 			WithViewConsumerBuilder(opts.builders.consumer),
+			WithViewCleanerPolicy(opts.cleanerPolicy),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error creating view: %v", err)

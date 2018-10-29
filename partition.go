@@ -236,13 +236,18 @@ func (p *partition) recovered() bool {
 }
 
 func (p *partition) clean(ctx context.Context) error {
+	st, ok := p.st.Storage.(storage.Cleanable)
+	if !ok {
+		return fmt.Errorf("misconfiguration: cleaning enabled on an unsupported storage")
+	}
+
 	lwm, err := p.proxy.LowWaterMark(p.topic)
 	if err != nil {
 		return err
 	}
 
 	began := time.Now()
-	deleted, err := p.st.DeleteUntil(ctx, lwm)
+	deleted, err := st.DeleteUntil(ctx, lwm)
 	if err != nil {
 		return err
 	}

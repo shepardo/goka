@@ -315,7 +315,7 @@ func TestPartition_cleanView(t *testing.T) {
 	defer ctrl.Finish()
 
 	proxy := mock.NewMockkafkaProxy(ctrl)
-	st := mock.NewMockStorage(ctrl)
+	st := mock.NewMockCleanable(ctrl)
 
 	cleaner := make(chan CleanerCallback)
 
@@ -403,7 +403,7 @@ func TestPartition_cleanProcessor(t *testing.T) {
 	}
 
 	proxy := mock.NewMockkafkaProxy(ctrl)
-	st := mock.NewMockStorage(ctrl)
+	st := mock.NewMockCleanable(ctrl)
 
 	p := partition{
 		topic: "test-table",

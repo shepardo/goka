@@ -119,6 +119,7 @@ func TestMergeIterator(t *testing.T) {
 			t.Fatalf("expected an empty merge iterator failing to seek")
 		}
 	})
+
 }
 
 func testOrderedIteration(t *testing.T, iter Iterator) {

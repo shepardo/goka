@@ -40,8 +40,9 @@ type mergeIterator struct {
 	iters []Iterator
 }
 
-// MergeIterator merges and iterates over the given iterators. Iteration happens
-// in lexicographical order given that the underlying iterators are also sorted.
+// MergeIterator returns a new Iterator that iterates over the given
+// subiterators. Iteration happens in lexicographical order given that the
+// subiterators also return values in lexicographical order.
 func MergeIterator(iters []Iterator) Iterator {
 	miter := &mergeIterator{
 		iters: iters,
@@ -69,14 +70,14 @@ func (m *mergeIterator) buildHeap(hasValue func(i Iterator) bool) {
 	}
 }
 
-// Key returns the current key. Caller should not modify or keep references
-// to the returned buffer.
+// Key returns the current key. Caller should not keep references to the
+// buffer or modify its contents.
 func (m *mergeIterator) Key() []byte {
 	return m.key
 }
 
-// Value returns the current value. Caller should not modify or keep references
-// to the returned buffer.
+// Value returns the current value. Caller should not keep references to the
+// buffer or modify its contents.
 func (m *mergeIterator) Value() []byte {
 	return m.value
 }
@@ -93,9 +94,10 @@ func (m *mergeIterator) Seek(key []byte) bool {
 	return m.err == nil && len(m.heap) > 0
 }
 
-// Next moves the iterator to the next key-value pair and returns whether such
-// a pair exists. Caller should remember to call Error to check whether the
-// iterator exhausted or encountered an error.
+// Seek moves the iterator to the begining of a key-value pair sequence that
+// is greater or equal to the given key. It returns whether at least one of
+// such key-value pairs exist. Next must be called after seeking to access
+// the first pair.
 func (m *mergeIterator) Next() bool {
 	if m.err != nil || len(m.heap) == 0 {
 		return false
@@ -122,7 +124,8 @@ func (m *mergeIterator) Error() error {
 	return m.err
 }
 
-// Release frees up the resources used by the iterator.
+// Release frees up the resources used by the iterator. This will also release
+// the subiterators.
 func (m *mergeIterator) Release() {
 	for i := range m.iters {
 		m.iters[i].Release()
