@@ -2,9 +2,9 @@
 package leveldb
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/lovoo/goka/multierr"
 	"github.com/lovoo/goka/storage"
@@ -21,6 +21,9 @@ const (
 type Storage struct {
 	currentOffset int64
 
+	ktoOnce     sync.Once
+	keyToOffset map[string]int64
+
 	tx *leveldb.Transaction
 	db *leveldb.DB
 }
@@ -34,6 +37,8 @@ func New(db *leveldb.DB) (*Storage, error) {
 	return &Storage{
 		tx: tx,
 		db: db,
+
+		keyToOffset: make(map[string]int64),
 
 		currentOffset: -1,
 	}, nil
@@ -136,21 +141,20 @@ func (s *Storage) Set(key string, val []byte, offset int64) error {
 
 	bkey := []byte(key)
 	boff := marshalOffset(offset)
-	kto := idxKeyToOffset(bkey)
 
 	b := &leveldb.Batch{}
-	b.Put(kto, boff)                  // key -> offset
+	b.Put(idxKeyToOffset(bkey), boff) // key -> offset
 	b.Put(idxOffsetToKey(boff), bkey) // offset -> key
 	b.Put(idxKeyToValue(bkey), val)   // key -> value
 
-	if s.tx != nil {
-		return s.tx.Write(b, nil)
+	if old, ok := s.keyToOffset[key]; ok {
+		b.Delete(idxOffsetToKey(marshalOffset(old))) // delete old offset -> key
 	}
 
-	if oldOffset, err := s.db.Get(kto, nil); err != nil && err != leveldb.ErrNotFound {
-		return err
-	} else {
-		b.Delete(idxOffsetToKey(oldOffset)) // delete old offset -> key
+	s.keyToOffset[key] = offset
+
+	if s.tx != nil {
+		return s.tx.Write(b, nil)
 	}
 
 	return s.db.Write(b, nil)
@@ -174,6 +178,7 @@ func (s *Storage) DeleteUntil(ctx context.Context, offset int64) (int64, error) 
 		b.Delete(idxKeyToOffset(iter.Key()))
 		b.Delete(idxOffsetToKey(iter.Offset()))
 		b.Delete(idxKeyToValue(iter.Key()))
+		delete(s.keyToOffset, string(iter.Key()))
 		count++
 
 		if len(b.Dump()) >= batchFlushSize {
@@ -212,68 +217,15 @@ func (s *Storage) Delete(key string) error {
 	b := &leveldb.Batch{}
 	b.Delete(kto)                 // key -> offset
 	b.Delete(idxKeyToValue(bkey)) // key -> value
+	if offset, ok := s.keyToOffset[key]; ok {
+		b.Delete(idxOffsetToKey(marshalOffset(offset)))
+		delete(s.keyToOffset, key)
+	}
 
 	if s.tx != nil {
 		return s.tx.Write(b, nil)
 	}
 
-	if offset, err := s.db.Get(kto, nil); err != nil && err != leveldb.ErrNotFound {
-		return err
-	} else {
-		b.Delete(idxOffsetToKey(offset)) // offset -> key
-	}
-
-	return s.db.Write(b, nil)
-}
-
-func (s *Storage) pruneOffsets() error {
-	oldestPruned := int64(0)
-
-	val, err := s.db.Get(keyOldestPrunedOffset, nil)
-	if err != nil {
-		if err != leveldb.ErrNotFound {
-			return err
-		}
-	} else {
-		oldestPruned = unmarshalOffset(val)
-	}
-
-	iter := s.offsetKeyIterator(oldestPruned, 0)
-	defer iter.Release()
-
-	b := &leveldb.Batch{}
-
-	for iter.Next() {
-		deleted := false
-		old := iter.Offset()
-
-		current, err := s.db.Get(idxKeyToOffset(iter.Key()), nil)
-		if err == leveldb.ErrNotFound {
-			deleted = true
-		} else if err != nil {
-			return err
-		}
-
-		if bytes.Equal(old, current) && !deleted {
-			continue
-		}
-
-		b.Delete(idxOffsetToKey(old))
-
-		if len(b.Dump()) >= batchFlushSize {
-			if err := s.db.Write(b, nil); err != nil {
-				return err
-			}
-
-			b.Reset()
-		}
-	}
-
-	if err := iter.Error(); err != nil {
-		return err
-	}
-
-	b.Put(keyOldestPrunedOffset, marshalOffset(s.currentOffset))
 	return s.db.Write(b, nil)
 }
 
@@ -284,7 +236,7 @@ func (s *Storage) MarkRecovered() error {
 
 	s.tx = nil
 
-	return s.pruneOffsets()
+	return nil
 }
 
 func (s *Storage) SetOffset(offset int64) error {
@@ -296,18 +248,29 @@ func (s *Storage) SetOffset(offset int64) error {
 
 	b := &leveldb.Batch{}
 	b.Put(keyLocalOffset, boff)
+	s.currentOffset = offset
 
 	if s.tx != nil {
 		return s.tx.Write(b, nil)
 	}
 
-	s.currentOffset = offset
-	b.Put(keyOldestPrunedOffset, boff)
 	return s.db.Write(b, nil)
 }
 
 func (s *Storage) Open() error {
-	return nil
+	var err error
+	s.ktoOnce.Do(func() {
+		iter := s.offsetKeyIterator(0, 0)
+		defer iter.Release()
+
+		for iter.Next() {
+			s.keyToOffset[string(iter.Key())] = unmarshalOffset(iter.Offset())
+		}
+
+		err = iter.Error()
+	})
+
+	return err
 }
 
 func (s *Storage) Close() error {
