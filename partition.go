@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/lovoo/goka/kafka"
@@ -38,19 +37,17 @@ const (
 //   close the storage proxy.
 //
 type partition struct {
-	log   logger.Logger
-	topic string
+	log       logger.Logger
+	topic     string
+	partition int32
 
 	ch      chan kafka.Event
 	st      *storageProxy
-	proxy   kafkaProxy
 	process processCallback
 
-	recoveredFlag int32
-	hwm           int64
-	offset        int64
-
-	recoveredOnce sync.Once
+	hwm             int64
+	offset          int64
+	recoveredSignal *Signal
 
 	stats         *PartitionStats
 	lastStats     *PartitionStats
@@ -65,17 +62,25 @@ type kafkaProxy interface {
 	Stop()
 }
 
+const (
+	notRecovered State = 0
+	recovered    State = 1
+)
+
 type processCallback func(msg *message, st storage.Storage, wg *sync.WaitGroup, pstats *PartitionStats) (int, error)
 
-func newPartition(log logger.Logger, topic string, cb processCallback, st *storageProxy, proxy kafkaProxy, channelSize int) *partition {
+func newPartition(log logger.Logger, topic string, partitionID int32, cb processCallback, st *storageProxy, channelSize int) *partition {
 	return &partition{
-		log:   log,
-		topic: topic,
+		log:       log,
+		topic:     topic,
+		partition: partitionID,
 
-		ch:      make(chan kafka.Event, channelSize),
-		st:      st,
-		proxy:   proxy,
+		ch: make(chan kafka.Event, channelSize),
+		st: st,
+
 		process: cb,
+
+		recoveredSignal: NewSignal(notRecovered, recovered),
 
 		stats:         newPartitionStats(),
 		lastStats:     newPartitionStats(),
@@ -84,250 +89,230 @@ func newPartition(log logger.Logger, topic string, cb processCallback, st *stora
 	}
 }
 
-// reinit reinitialzes the partition to connect to Kafka and start its goroutine
-func (p *partition) reinit(proxy kafkaProxy) {
-	if proxy != nil {
-		p.proxy = proxy
-	}
-}
-
 // start loads the table partition up to HWM and then consumes streams
-func (p *partition) start(ctx context.Context) error {
-	defer p.proxy.Stop()
+func (p *partition) catchupToHwmAndRun(ctx context.Context, consumer sarama.Consumer) error {
 	p.stats.Table.StartTime = time.Now()
 
+	// have no state, nothing to catch up from
 	if p.st.Stateless() {
-		if err := p.markRecovered(false); err != nil {
-			return fmt.Errorf("error marking stateless partition as recovered: %v", err)
-		}
-	} else if err := p.recover(ctx); err != nil {
-		return err
+		return p.markRecovered(true)
 	}
 
-	// if stopped, just return
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-	}
-
-	return p.run(ctx)
+	// catchup until hwm
+	return p.load(ctx, consumer, true)
 }
 
-// startCatchup continually loads the table partition
-func (p *partition) startCatchup(ctx context.Context) error {
-	defer p.proxy.Stop()
+// continue
+func (p *partition) catchupForever(ctx context.Context, consumer sarama.Consumer) error {
 	p.stats.Table.StartTime = time.Now()
-
-	return p.catchup(ctx)
+	return p.load(ctx, consumer, false)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // processing
 ///////////////////////////////////////////////////////////////////////////////
-func newMessage(ev *kafka.Message) *message {
+func newMessage(ev *sarama.ConsumerMessage) *message {
 	return &message{
 		Topic:     ev.Topic,
 		Partition: ev.Partition,
 		Offset:    ev.Offset,
 		Timestamp: ev.Timestamp,
 		Data:      ev.Value,
-		Key:       ev.Key,
+		Key:       string(ev.Key),
 	}
 }
 
-func (p *partition) run(ctx context.Context) error {
+func (p *partition) consumeClaim(claim sarama.GroupConsumerClaim) error {
 	var wg sync.WaitGroup
-	p.proxy.AddGroup()
+
+	// TODO: do a timeout
 	defer wg.Wait()
 
 	for {
 		select {
-		case ev, isOpen := <-p.ch:
-			// channel already closed, ev will be nil
-			if !isOpen {
-				return nil
+		case msg, ok := <-claim.Messages():
+			if !ok {
+				return
 			}
-			switch ev := ev.(type) {
-			case *kafka.Message:
-				if ev.Topic == p.topic {
-					return fmt.Errorf("received message from group table topic after recovery: %s", p.topic)
-				}
-
-				updates, err := p.process(newMessage(ev), p.st, &wg, p.stats)
-				if err != nil {
-					return fmt.Errorf("error processing message: %v", err)
-				}
-				p.offset += int64(updates)
-				p.hwm = p.offset + 1
-
-				// metrics
-				s := p.stats.Input[ev.Topic]
-				s.Count++
-				s.Bytes += len(ev.Value)
-				if !ev.Timestamp.IsZero() {
-					s.Delay = time.Since(ev.Timestamp)
-				}
-				p.stats.Input[ev.Topic] = s
-
-			case *kafka.NOP:
-				// don't do anything but also don't log.
-			case *kafka.EOF:
-			//	if ev.Topic != p.topic {
-			//		return fmt.Errorf("received EOF of topic that is not ours. This should not happend (ours=%s, received=%s)", p.topic, ev.Topic)
-			//	}
-			default:
-				return fmt.Errorf("load: cannot handle %T = %v", ev, ev)
-			}
-
+			part.consumeMessage(g.ctx, &wg, msg)
 		case <-p.requestStats:
 			p.lastStats = newPartitionStats().init(p.stats, p.offset, p.hwm)
 			select {
 			case p.responseStats <- p.lastStats:
 			case <-ctx.Done():
-				return nil
+				// Async close is safe to be called multiple times
+				partConsumer.AsyncClose()
 			}
-
 		case <-ctx.Done():
-			return nil
+			// Async close is safe to be called multiple times
+			partConsumer.AsyncClose()
 		}
-
 	}
+}
+
+func (p *partition) consumeMessage(ctx context.Context, wg *sync.WaitGroup, message *sarama.ConsumerMessage) error {
+
+	updates, err := p.process(newMessage(message), p.st, wg, p.stats)
+	if err != nil {
+		return fmt.Errorf("error processing message: %v", err)
+	}
+	p.offset += int64(updates)
+	p.hwm = p.offset + 1
+
+	// metrics
+	s := p.stats.Input[message.Topic]
+	s.Count++
+	s.Bytes += len(message.Value)
+	if !message.Timestamp.IsZero() {
+		s.Delay = time.Since(message.Timestamp)
+	}
+	p.stats.Input[message.Topic] = s
+	return nil
+}
+
+func (p *partition) dumpStats() *PartitionStats {
+	return newPartitionStats().init(p.stats, p.offset, p.hwm)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // loading storage
 ///////////////////////////////////////////////////////////////////////////////
 
-func (p *partition) catchup(ctx context.Context) error {
-	return p.load(ctx, true)
-}
-
-func (p *partition) recover(ctx context.Context) error {
-	return p.load(ctx, false)
-}
-
 func (p *partition) recovered() bool {
-	return atomic.LoadInt32(&p.recoveredFlag) == 1
+	return p.recoveredSignal.IsState(recovered)
 }
 
-func (p *partition) load(ctx context.Context, catchup bool) (rerr error) {
+func (p *partition) load(ctx context.Context, consumer sarama.Consumer, catchup bool) error {
 	// fetch local offset
-	if local, err := p.st.GetOffset(sarama.OffsetOldest); err != nil {
+	var (
+		localOffset  int64
+		partitionHwm int64
+		partConsumer sarama.PartitionConsumer
+		err          error
+	)
+	localOffset, err = p.st.GetOffset(sarama.OffsetOldest)
+	if err != nil {
 		return fmt.Errorf("error reading local offset: %v", err)
-	} else if err = p.proxy.Add(p.topic, local); err != nil {
-		return err
 	}
 
-	defer func() {
-		var derr multierr.Errors
-		_ = derr.Collect(rerr)
-		if e := p.proxy.Remove(p.topic); e != nil {
-			_ = derr.Collect(e)
-		}
-		rerr = derr.NilOrError()
-	}()
+	hwms := consumer.HighWaterMarks()
+	partitionHwm = hwms[p.topic][p.partition]
 
-	stallTicker := time.NewTicker(stallPeriod)
-	defer stallTicker.Stop()
+	if localOffset >= partitionHwm {
+		return fmt.Errorf("local offset is higher than partition offset. topic %s, partition %d, hwm %d, local offset %d", p.topic, p.partition, partitionHwm, localOffset)
+	}
+
+	// we are exactly where we're supposed to be
+	// AND we're here for catchup, so let's stop here
+	if localOffset == partitionHwm-1 && catchup {
+		return nil
+	}
+
+	partConsumer, err = consumer.ConsumePartition(p.topic, p.partition, localOffset)
+	if err != nil {
+		return fmt.Errorf("Error creating partition consumer for topic %s, partition %d, offset %d: %v", p.topic, p.partition, localOffset, err)
+	}
 
 	// reset stats after load
 	defer p.stats.reset()
 
-	var lastMessage time.Time
-	for {
-		select {
-		case ev, isOpen := <-p.ch:
+	errs, ctx := multierr.NewErrGroup(ctx)
 
-			// channel already closed, ev will be nil
-			if !isOpen {
-				return nil
+	errs.Go(func() error {
+		errs := new(multierr.Errors)
+		for {
+			select {
+			case consError, ok := <-partConsumer.Errors():
+				if !ok {
+					break
+				}
+				errs.Collect(consError)
 			}
+		}
+		return errs.NilOrError()
+	})
 
-			switch ev := ev.(type) {
-			case *kafka.BOF:
-				p.hwm = ev.Hwm
+	errs.Go(func() error {
+		stallTicker := time.NewTicker(stallPeriod)
+		defer stallTicker.Stop()
 
-				if ev.Offset == ev.Hwm {
-					// nothing to recover
-					if err := p.markRecovered(false); err != nil {
-						return fmt.Errorf("error setting recovered: %v", err)
-					}
+		errs := new(multierr.Errors)
+		lastMessage := time.Now()
+
+		for {
+			select {
+			case msg, ok := <-partConsumer.Messages():
+				if !ok {
+					break
 				}
 
-			case *kafka.EOF:
-				p.offset = ev.Hwm - 1
-				p.hwm = ev.Hwm
-
-				if err := p.markRecovered(catchup); err != nil {
-					return fmt.Errorf("error setting recovered: %v", err)
-				}
-
-				if catchup {
+				if p.recoveredSignal.IsState(1) && catchup {
+					p.log.Printf("received message in topic %s, partition %s after catchup. Another processor is still producing messages. Ignoring message.", p.topic, p.partition)
 					continue
 				}
-				return nil
 
-			case *kafka.Message:
 				lastMessage = time.Now()
-				if ev.Topic != p.topic {
-					p.log.Printf("dropping message from topic = %s while loading", ev.Topic)
-					continue
+				if msg.Topic != p.topic {
+					return errs.Collect(fmt.Errorf("Got unexpected topic %s, require %s", msg.Topic, p.topic))
 				}
-				if err := p.storeEvent(ev); err != nil {
+				if err := p.storeEvent(string(msg.Key), msg.Value, msg.Offset); err != nil {
 					return fmt.Errorf("load: error updating storage: %v", err)
 				}
-				p.offset = ev.Offset
-				if p.offset >= p.hwm-1 {
+				p.offset = msg.Offset
+
+				if msg.Offset >= partitionHwm-1 {
+
 					if err := p.markRecovered(catchup); err != nil {
 						return fmt.Errorf("error setting recovered: %v", err)
+					}
+					if catchup {
+						// close the consumer. We will continue draining errors and messages, until both are closed.
+						partConsumer.AsyncClose()
 					}
 				}
 
 				// update metrics
-				s := p.stats.Input[ev.Topic]
+				s := p.stats.Input[msg.Topic]
 				s.Count++
-				s.Bytes += len(ev.Value)
-				if !ev.Timestamp.IsZero() {
-					s.Delay = time.Since(ev.Timestamp)
+				s.Bytes += len(msg.Value)
+				if !msg.Timestamp.IsZero() {
+					s.Delay = time.Since(msg.Timestamp)
 				}
-				p.stats.Input[ev.Topic] = s
+				p.stats.Input[msg.Topic] = s
 				p.stats.Table.Stalled = false
+			case now := <-stallTicker.C:
+				// only set to stalled, if the last message was earlier
+				// than the stalled timeout
+				if now.Sub(lastMessage) > stalledTimeout {
+					p.stats.Table.Stalled = true
+				}
 
-			case *kafka.NOP:
-				// don't do anything
-
-			default:
-				return fmt.Errorf("load: cannot handle %T = %v", ev, ev)
-			}
-
-		case now := <-stallTicker.C:
-			// only set to stalled, if the last message was earlier
-			// than the stalled timeout
-			if now.Sub(lastMessage) > stalledTimeout {
-				p.stats.Table.Stalled = true
-			}
-
-		case <-p.requestStats:
-			p.lastStats = newPartitionStats().init(p.stats, p.offset, p.hwm)
-			select {
-			case p.responseStats <- p.lastStats:
+			case <-p.requestStats:
+				p.lastStats = newPartitionStats().init(p.stats, p.offset, p.hwm)
+				select {
+				case p.responseStats <- p.lastStats:
+				case <-ctx.Done():
+					// Async close is safe to be called multiple times
+					partConsumer.AsyncClose()
+				}
 			case <-ctx.Done():
-				return nil
+				// Async close is safe to be called multiple times
+				partConsumer.AsyncClose()
 			}
-
-		case <-ctx.Done():
-			return nil
 		}
-	}
+
+		return errs.NilOrError()
+	})
+
+	return errs.Wait().NilOrError()
 }
 
-func (p *partition) storeEvent(msg *kafka.Message) error {
-	err := p.st.Update(msg.Key, msg.Value)
+func (p *partition) storeEvent(key string, value []byte, offset int64) error {
+	err := p.st.Update(key, value)
 	if err != nil {
 		return fmt.Errorf("Error from the update callback while recovering from the log: %v", err)
 	}
-	err = p.st.SetOffset(msg.Offset)
+	err = p.st.SetOffset(offset)
 	if err != nil {
 		return fmt.Errorf("Error updating offset in local storage while recovering from the log: %v", err)
 	}
@@ -335,63 +320,33 @@ func (p *partition) storeEvent(msg *kafka.Message) error {
 }
 
 // mark storage as recovered
-func (p *partition) markRecovered(catchup bool) (err error) {
-	p.recoveredOnce.Do(func() {
-		p.lastStats = newPartitionStats().init(p.stats, p.offset, p.hwm)
-		p.lastStats.Table.Status = PartitionPreparing
+func (p *partition) markRecovered(catchup bool) error {
+	// already recovered
+	if p.recoveredSignal.IsState(1) {
+		return nil
+	}
 
-		var (
-			done = make(chan bool)
-			wg   sync.WaitGroup
-		)
-		if catchup {
-			// if catching up (views), stop reading from topic before marking
-			// partition as recovered to avoid blocking other partitions when
-			// p.ch gets full
-			if err = p.proxy.Remove(p.topic); err != nil {
-				return
-			}
+	p.lastStats = newPartitionStats().init(p.stats, p.offset, p.hwm)
+	p.lastStats.Table.Status = PartitionPreparing
 
-			// drain events channel -- we'll fetch them again later
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-p.ch:
-					case <-done:
-						return
-					}
-				}
-			}()
-		}
+	// mark storage as recovered -- this may take long
+	// TODO: have a ticker that says we're still waiting for the storage to
+	// be marked as recoverered
+	if err := p.st.MarkRecovered(); err != nil {
+		return fmt.Errorf("Error marking storage recovered topic %s, partition %s: %v", p.topic, p.partition, err)
+	}
 
-		// mark storage as recovered -- this may take long
-		if err = p.st.MarkRecovered(); err != nil {
-			close(done)
-			return
-		}
+	// update stats
+	p.stats.Table.Status = PartitionRunning
+	p.stats.Table.RecoveryTime = time.Now()
 
-		if catchup {
-			close(done)
-			wg.Wait()
-			// start reading from topic again if in catchup mode
-			if err = p.proxy.Add(p.topic, p.hwm); err != nil {
-				return
-			}
-		}
-
-		// update stats
-		p.stats.Table.Status = PartitionRunning
-		p.stats.Table.RecoveryTime = time.Now()
-
-		atomic.StoreInt32(&p.recoveredFlag, 1)
-	})
+	p.recoveredSignal.SetState(1)
 
 	// Be sure to mark partition as not stalled after EOF arrives, as
 	// this will not be written in the run-method
 	p.stats.Table.Stalled = false
-	return
+
+	return nil
 }
 
 func (p *partition) fetchStats(ctx context.Context) *PartitionStats {

@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Shopify/sarama"
 	"github.com/lovoo/goka/kafka"
 	"github.com/lovoo/goka/logger"
 	"github.com/lovoo/goka/multierr"
@@ -22,17 +24,20 @@ type Processor struct {
 	opts    *poptions
 	brokers []string
 
-	partitions     map[int32]*partition
+	partitions map[int32]*partition
+	// rename to joined partitions
 	partitionViews map[int32]map[string]*partition
 	partitionCount int
-	views          map[string]*View
+	// TODO rename to lookup tables
+	views map[string]*View
 
 	graph *GroupGraph
 	m     sync.RWMutex
 
-	consumer kafka.Consumer
-	producer kafka.Producer
-	asCh     chan kafka.Assignment
+	saramaConsumer sarama.Consumer
+	consumer       kafka.Consumer
+	producer       kafka.Producer
+	asCh           chan kafka.Assignment
 
 	errors *multierr.Errors
 	cancel func()
@@ -85,24 +90,6 @@ func NewProcessor(brokers []string, gg *GroupGraph, options ...ProcessorOption) 
 		return nil, err
 	}
 
-	// create views
-	views := make(map[string]*View)
-	for _, t := range gg.LookupTables() {
-		view, err := NewView(brokers, Table(t.Topic()), t.Codec(),
-			WithViewLogger(opts.log),
-			WithViewHasher(opts.hasher),
-			WithViewPartitionChannelSize(opts.partitionChannelSize),
-			WithViewClientID(opts.clientID),
-			WithViewTopicManagerBuilder(opts.builders.topicmgr),
-			WithViewStorageBuilder(opts.builders.storage),
-			WithViewConsumerBuilder(opts.builders.consumer),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error creating view: %v", err)
-		}
-		views[t.Topic()] = view
-	}
-
 	// combine things together
 	processor := &Processor{
 		opts:    opts,
@@ -111,14 +98,40 @@ func NewProcessor(brokers []string, gg *GroupGraph, options ...ProcessorOption) 
 		partitions:     make(map[int32]*partition),
 		partitionViews: make(map[int32]map[string]*partition),
 		partitionCount: npar,
-		views:          views,
+		views:          make(map[string]*View),
 
 		graph: gg,
 
 		asCh: make(chan kafka.Assignment, 1),
 	}
 
+	err = processor.createLookupTables(brokers)
+	if err != nil {
+		return nil, fmt.Errorf("Error creating lookup tables: %v", err)
+	}
+
 	return processor, nil
+}
+
+func (p *Processor) createLookupTables(brokers []string) error {
+	// create views
+	for _, t := range p.graph.LookupTables() {
+		view, err := NewView(brokers, Table(t.Topic()), t.Codec(),
+			WithViewLogger(p.opts.log),
+			WithViewHasher(p.opts.hasher),
+			WithViewPartitionChannelSize(p.opts.partitionChannelSize),
+			WithViewClientID(p.opts.clientID),
+			WithViewTopicManagerBuilder(p.opts.builders.topicmgr),
+			WithViewStorageBuilder(p.opts.builders.storage),
+			WithViewConsumerBuilder(p.opts.builders.consumer),
+		)
+		if err != nil {
+			return fmt.Errorf("error creating view: %v", err)
+		}
+		p.views[t.Topic()] = view
+	}
+
+	return nil
 }
 
 func prepareTopics(brokers []string, gg *GroupGraph, opts *poptions) (npar int, err error) {
@@ -288,19 +301,44 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 	}()
 
 	// create kafka consumer
-	g.opts.log.Printf("Processor: creating consumer [%s]", g.graph.Group())
-	consumer, err := g.opts.builders.consumer(g.brokers, string(g.graph.Group()), g.opts.clientID)
+	g.opts.log.Printf("Processor: creating group consumer [%s]", g.graph.Group())
+
+	config := sarama.NewConfig()
+	config.ClientID = g.opts.clientID
+	consumerGroup, err := sarama.NewConsumerGroup(g.brokers, string(g.graph.Group()), config)
 	if err != nil {
 		return fmt.Errorf(errBuildConsumer, err)
 	}
-	g.consumer = consumer
+
 	defer func() {
-		g.opts.log.Printf("Processor: closing consumer [%s]", g.graph.Group())
-		if err = g.consumer.Close(); err != nil {
-			_ = g.errors.Collect(fmt.Errorf("error closing consumer: %v", err))
+		rerr = consumerGroup.Close()
+
+	}()
+
+	go func() {
+		for err := range consumerGroup.Errors() {
+			g.opts.log.Printf("Error executing group consumer [%s]", g.graph.Group(), err)
+			g.errors.Collect(err)
 		}
 	}()
 
+	var topics []string
+	for _, e := range g.graph.InputStreams() {
+		topics = append(topics, e.Topic())
+	}
+
+	g.saramaConsumer, err = sarama.NewConsumer(g.brokers, config)
+	if err != nil {
+		return fmt.Errorf("Error creating consumer for brokers [%s]: %v", strings.Join(g.brokers, ","), err)
+	}
+	// g.consumer = consumer
+	// defer func() {
+	// 	g.opts.log.Printf("Processor: closing consumer [%s]", g.graph.Group())
+	// 	if err = g.consumer.Close(); err != nil {
+	// 		_ = g.errors.Collect(fmt.Errorf("error closing consumer: %v", err))
+	// 	}
+	// }()
+	//
 	// create kafka producer
 	g.opts.log.Printf("Processor: creating producer")
 	producer, err := g.opts.builders.producer(g.brokers, g.opts.clientID, g.opts.hasher)
@@ -327,36 +365,80 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 		defer func() { _ = g.errors.Collect(v.Terminate()) }()
 	}
 
-	// subscribe for streams
-	topics := make(map[string]int64)
-	for _, e := range g.graph.InputStreams() {
-		topics[e.Topic()] = -1
-	}
-	if lt := g.graph.LoopStream(); lt != nil {
-		topics[lt.Topic()] = -1
-	}
-	if err := g.consumer.Subscribe(topics); err != nil {
-		g.cancel()
-		_ = g.errors.Merge(errg.Wait())
-		return fmt.Errorf("error subscribing topics: %v", err)
-	}
-
-	// start processor dispatcher
+	// run the main rebalance-consume-loop
 	errg.Go(func() error {
-		g.asCh <- kafka.Assignment{}
-		return g.waitAssignment(ctx)
+		for {
+			err := consumerGroup.Consume(ctx, topics, g)
+			if err != nil {
+				return fmt.Errorf("Error running consumergroup [%s]: %v", g.graph.Group(), err)
+			}
+		}
 	})
 
-	// wait for goroutines to return
-	_ = g.errors.Merge(errg.Wait())
-
-	// remove all partitions first
-	g.opts.log.Printf("Processor: removing partitions")
-	for partition := range g.partitions {
-		_ = g.errors.Merge(g.removePartition(partition))
-	}
+	// // wait for goroutines to return
+	// _ = g.errors.Merge(errg.Wait())
+	//
+	// // remove all partitions first
+	// g.opts.log.Printf("Processor: removing partitions")
+	// for partition := range g.partitions {
+	// 	_ = g.errors.Merge(g.removePartition(partition))
+	// }
 
 	return nil
+}
+
+// Setup is run at the beginning of a new session, before ConsumeClaim.
+func (g *Processor) Setup(session sarama.ConsumerGroupSession) error {
+	g.opts.log.Printf("Processor [%s] setup generation %d", g.graph.Group(), session.GenerationID())
+	errs := new(multierr.Errors)
+	errg, ctx := multierr.NewErrGroup(g.ctx)
+	var partitions []int32
+	for _, claim := range session.Claims() {
+		partitions = claim
+		break
+	}
+
+	// no partitions configured, we cannot setup anything
+	if len(partitions) == 0 {
+		return errs.Collect(fmt.Errorf("No partitions assigned. Claims were: %#v", session.Claims()))
+	}
+
+	// create partition views for all partitions
+	for _, partition := range partitions {
+		err := g.createPartitionViews(errg, ctx, partition)
+		errs.Collect(err)
+
+		// create table partition
+		err = g.startProcessorPartition(ctx, errg, partition)
+		errs.Collect(err)
+	}
+
+	// wait for partition views to
+
+	return errs.NilOrError()
+}
+
+// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
+// but before the offsets are committed for the very last time.
+func (g *Processor) Cleanup(session sarama.ConsumerGroupSession) error {
+	errs := new(multierr.Errors)
+	for partition := range g.partitions {
+		_ = errs.Merge(g.removePartition(partition))
+	}
+	return errs
+}
+
+// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+// Once the Messages() channel is closed, the Handler must finish its processing
+// loop and exit.
+func (g *Processor) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+
+	part, has := g.partitions[claim.Partition()]
+	if !has {
+		return fmt.Errorf("No partition (%d) to handle input in topic %s", claim.Partition(), claim.Topic())
+	}
+
+	return part.consumeClaim(claim)
 }
 
 func (g *Processor) pushToPartition(ctx context.Context, part int32, ev kafka.Event) error {
@@ -534,6 +616,7 @@ func (g *Processor) newStorage(topic string, id int32, update UpdateCallback) (*
 	}, nil
 }
 
+// TODO: rename to joined tables
 func (g *Processor) createPartitionViews(errg *multierr.ErrGroup, ctx context.Context, id int32) error {
 	g.m.Lock()
 	defer g.m.Unlock()
@@ -553,7 +636,9 @@ func (g *Processor) createPartitionViews(errg *multierr.ErrGroup, ctx context.Co
 		p := newPartition(
 			g.opts.log,
 			t.Topic(),
-			nil, st, &proxy{id, g.consumer},
+			id,
+			nil, // processor callback not needed
+			st,
 			g.opts.partitionChannelSize,
 		)
 		g.partitionViews[id][t.Topic()] = p
@@ -567,11 +652,11 @@ func (g *Processor) createPartitionViews(errg *multierr.ErrGroup, ctx context.Co
 				}
 			}()
 
-			if err = p.st.Open(); err != nil {
-				return fmt.Errorf("error opening storage %s/%d: %v", p.topic, id, err)
+			if openErr := p.st.Open(); openErr != nil {
+				return fmt.Errorf("error opening storage %s/%d: %v", p.topic, id, openErr)
 			}
-			if err = p.startCatchup(ctx); err != nil {
-				return fmt.Errorf("error in partition view %s/%d: %v", p.topic, id, err)
+			if catchupErr := p.catchupForever(ctx, g.saramaConsumer); catchupErr != nil {
+				return fmt.Errorf("error in partition view %s/%d: %v", p.topic, id, catchupErr)
 			}
 			g.opts.log.Printf("partition view %s/%d: exit", p.topic, id)
 			return nil
@@ -580,23 +665,24 @@ func (g *Processor) createPartitionViews(errg *multierr.ErrGroup, ctx context.Co
 	return nil
 }
 
-func (g *Processor) createPartition(errg *multierr.ErrGroup, ctx context.Context, id int32) error {
-	if _, has := g.partitions[id]; has {
-		return nil
+// creates the partition that is responsible for the group processor's table
+func (g *Processor) startProcessorPartition(ctx context.Context, errg *multierr.ErrGroup, partition int32) error {
+	if _, has := g.partitions[partition]; has {
+		return fmt.Errorf("processor [%s]: partition %d already exists", g.graph.Group(), partition)
 	}
 	// TODO(diogo) what name to use for stateless processors?
 	var groupTable string
 	if gt := g.graph.GroupTable(); gt != nil {
 		groupTable = gt.Topic()
 	}
-	st, err := g.newStorage(groupTable, id, g.opts.updateCallback)
+	st, err := g.newStorage(groupTable, partition, g.opts.updateCallback)
 	if err != nil {
 		return fmt.Errorf("processor: error creating storage: %v", err)
 	}
 
 	// collect dependencies
 	var wait []func() bool
-	if pviews, has := g.partitionViews[id]; has {
+	if pviews, has := g.partitionViews[partition]; has {
 		for _, p := range pviews {
 			wait = append(wait, p.recovered)
 		}
@@ -605,28 +691,30 @@ func (g *Processor) createPartition(errg *multierr.ErrGroup, ctx context.Context
 		wait = append(wait, v.Recovered)
 	}
 
-	g.partitions[id] = newPartition(
+	g.partitions[partition] = newPartition(
 		g.opts.log,
 		groupTable,
-		g.process, st, &delayProxy{proxy: proxy{partition: id, consumer: g.consumer}, wait: wait},
+		partition,
+		g.process,
+		st,
 		g.opts.partitionChannelSize,
 	)
-	par := g.partitions[id]
+	par := g.partitions[partition]
 	errg.Go(func() (err error) {
 		defer func() {
 			if rerr := recover(); rerr != nil {
-				g.opts.log.Printf("partition %s/%d: panic", par.topic, id)
+				g.opts.log.Printf("partition %s/%d: panic", par.topic, partition)
 				err = fmt.Errorf("partition %s/%d: panic: %v\nstack:%v",
-					par.topic, id, rerr, string(debug.Stack()))
+					par.topic, partition, rerr, string(debug.Stack()))
 			}
 		}()
 		if err = par.st.Open(); err != nil {
-			return fmt.Errorf("error opening storage partition %d: %v", id, err)
+			return fmt.Errorf("error opening storage partition %d: %v", partition, err)
 		}
-		if err = par.start(ctx); err != nil {
-			return fmt.Errorf("error in partition %d: %v", id, err)
+		if err = par.catchupToHwmAndRun(ctx, g.saramaConsumer); err != nil {
+			return fmt.Errorf("error in partition %d: %v", partition, err)
 		}
-		g.opts.log.Printf("partition %s/%d: exit", par.topic, id)
+		g.opts.log.Printf("partition %s/%d: exit", par.topic, partition)
 		return nil
 	})
 
@@ -698,10 +786,12 @@ func (g *Processor) process(msg *message, st storage.Storage, wg *sync.WaitGroup
 		graph: g.graph,
 
 		pstats: pstats,
+		// joined tables
 		pviews: views,
-		views:  g.views,
-		wg:     wg,
-		msg:    msg,
+		// lookups
+		views: g.views,
+		wg:    wg,
+		msg:   msg,
 		failer: func(err error) {
 			// only fail processor if context not already Done
 			select {

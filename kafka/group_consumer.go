@@ -263,6 +263,7 @@ func (c *groupConsumer) Commit(topic string, partition int32, offset int64) erro
 
 //go:generate mockgen -package mock -destination=mock/cluster_consumer.go -source=group_consumer.go clusterConsumer
 type clusterConsumer interface {
+	// Close
 	Close() error
 	MarkPartitionOffset(topic string, partition int32, offset int64, metadata string)
 
