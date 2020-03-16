@@ -1,7 +1,6 @@
 package tester
 
 import (
-	"flag"
 	"fmt"
 	"hash"
 	"reflect"
@@ -22,7 +21,6 @@ type nilLogger int
 func (*nilLogger) Printf(s string, args ...interface{}) {}
 
 var (
-	debug              = flag.Bool("tester-debug", false, "show debug prints of the tester.")
 	logger debugLogger = new(nilLogger)
 )
 
