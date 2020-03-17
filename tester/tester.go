@@ -191,6 +191,7 @@ func (tt *Tester) RegisterGroupGraph(gg *goka.GroupGraph) string {
 
 // RegisterView registers a new view to the tester
 func (tt *Tester) RegisterView(table goka.Table, c goka.Codec) string {
+	tt.registerCodec(string(table), c)
 	client := tt.nextClient()
 	client.requireConsumer(string(table))
 	return client.clientID
@@ -199,7 +200,6 @@ func (tt *Tester) RegisterView(table goka.Table, c goka.Codec) string {
 // RegisterEmitter registers an emitter to be working with the tester.
 func (tt *Tester) RegisterEmitter(topic goka.Stream, codec goka.Codec) {
 	tt.registerCodec(string(topic), codec)
-	tt.getOrCreateQueue(string(topic))
 }
 
 func (tt *Tester) getOrCreateQueue(topic string) *queue {
