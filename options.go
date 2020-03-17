@@ -348,6 +348,7 @@ func WithViewTester(t Tester) ViewOption {
 	return func(o *voptions, table Table, codec Codec) {
 		o.builders.storage = t.StorageBuilder()
 		o.builders.topicmgr = t.TopicManagerBuilder()
+		o.builders.consumerSarama = t.ConsumerBuilder()
 		o.clientID = t.RegisterView(table, codec)
 	}
 }

@@ -74,9 +74,10 @@ type QueueTracker struct {
 
 func newQueueTracker(tester *Tester, t T, topic string) *QueueTracker {
 	return &QueueTracker{
-		t:      t,
-		topic:  topic,
-		tester: tester,
+		t:          t,
+		topic:      topic,
+		tester:     tester,
+		nextOffset: tester.getOrCreateQueue(topic).hwm,
 	}
 }
 

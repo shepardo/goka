@@ -436,7 +436,10 @@ func (pp *PartitionProcessor) processMessage(ctx context.Context, wg *sync.WaitG
 	// decide whether to decode or ignore message
 	switch {
 	case msg.Value == nil && pp.opts.nilHandling == NilIgnore:
-		// drop nil messages
+		// mark the message upstream so we don't receive it again.
+		// this is usually only an edge case in unit tests, as kafka probably never sends us nil messages
+		pp.session.MarkMessage(msg, "")
+		// otherwise drop it.
 		return nil
 	case msg.Value == nil && pp.opts.nilHandling == NilProcess:
 		// process nil messages without decoding them

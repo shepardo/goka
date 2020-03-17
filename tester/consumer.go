@@ -64,6 +64,8 @@ func (cm *consumerMock) ConsumePartition(topic string, partition int32, offset i
 		},
 	}
 
+	cm.partConsumers[topic] = cons
+
 	return cons, nil
 }
 func (cm *consumerMock) HighWaterMarks() map[string]map[int32]int64 {

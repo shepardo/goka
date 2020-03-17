@@ -259,8 +259,10 @@ func (tt *Tester) TableValue(table goka.Table, key string) interface{} {
 }
 
 // SetTableValue sets a value in a processor's or view's table direcly via storage
+// This method blocks until all expected clients are running, so make sure
+// to call it *after* you have started all processors/views, otherwise it'll deadlock.
 func (tt *Tester) SetTableValue(table goka.Table, key string, value interface{}) {
-	logger.Printf("setting value is not implemented yet.")
+	tt.waitStartup()
 
 	topic := string(table)
 	st, err := tt.getOrCreateStorage(topic)
@@ -323,6 +325,7 @@ func (tt *Tester) waitStartup() {
 		client.waitStartup()
 	}
 }
+
 func (tt *Tester) waitForClients() {
 	logger.Printf("waiting for consumers")
 
