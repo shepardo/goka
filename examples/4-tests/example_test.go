@@ -107,6 +107,26 @@ func Test_SetTableValue(t *testing.T) {
 	test.AssertEqual(t, value, int64(12))
 }
 
+func Test_JoinOutput(t *testing.T) {
+
+	var (
+		gkt = tester.New(t)
+	)
+
+	// create a new processor, registering the tester
+	proc, _ := goka.NewProcessor([]string{}, goka.DefineGroup("group",
+		goka.Input("input", new(codec.Int64), func(ctx goka.Context, msg interface{}) {
+		}),
+		goka.Output("output", new(codec.Int64)),
+		goka.Join("join", new(codec.Int64)),
+	),
+		goka.WithTester(gkt),
+	)
+	go proc.Run(context.Background())
+
+	gkt.Consume("input", "value", int64(2))
+}
+
 // Scenario (3)
 // Instead of an output we will persist the message
 func Test_3Persist(t *testing.T) {
