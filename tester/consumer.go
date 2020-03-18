@@ -29,7 +29,6 @@ func (cm *consumerMock) catchup() int {
 	var catchup int
 	for _, pc := range cm.partConsumers {
 		catchup += pc.catchup()
-		return catchup
 	}
 	return catchup
 }
@@ -55,7 +54,7 @@ func (cm *consumerMock) ConsumePartition(topic string, partition int32, offset i
 		errors:   make(chan *sarama.ConsumerError),
 		closer: func() error {
 			cm.Lock()
-			cm.Unlock()
+			defer cm.Unlock()
 			if _, exists := cm.partConsumers[topic]; !exists {
 				return fmt.Errorf("partition consumer seems already closed")
 			}

@@ -86,6 +86,15 @@ func (p *PartitionTable) SetupAndRecover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// do not continue if the context is already cancelled.
+	// this can happen if the context was closed during opening the storage.
+	// Since this is no error we have to check it here, otherwise it'll nil-panic later.
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
 	return p.load(ctx, true)
 }
 
@@ -151,7 +160,7 @@ WaitLoop:
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("context canceled")
+			return nil, nil
 		case <-ticker.C:
 			p.log.Printf("creating storage for topic %s/%d for %.1f minutes ...", p.topic, p.partition, time.Since(start).Minutes())
 		case <-done:
