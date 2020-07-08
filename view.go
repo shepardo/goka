@@ -46,8 +46,6 @@ type View struct {
 	opts       *voptions
 	log        logger.Logger
 	partitions []*PartitionTable
-	consumer   sarama.Consumer
-	tmgr       TopicManager
 	state      *Signal
 }
 
@@ -72,29 +70,14 @@ func NewView(brokers []string, topic Table, codec Codec, options ...ViewOption) 
 		return nil, fmt.Errorf("Error applying user-defined options: %v", err)
 	}
 
-	consumer, err := opts.builders.consumerSarama(brokers, opts.clientID)
-	if err != nil {
-		return nil, fmt.Errorf("Error creating sarama consumer for brokers %+v: %v", brokers, err)
-	}
 	opts.tableCodec = codec
 
-	tmgr, err := opts.builders.topicmgr(brokers)
-	if err != nil {
-		return nil, fmt.Errorf("Error creating topic manager: %v", err)
-	}
-
 	v := &View{
-		brokers:  brokers,
-		topic:    string(topic),
-		opts:     opts,
-		log:      opts.log.Prefix(fmt.Sprintf("View %s", topic)),
-		consumer: consumer,
-		tmgr:     tmgr,
-		state:    newViewSignal(),
-	}
-
-	if err = v.createPartitions(brokers); err != nil {
-		return nil, err
+		brokers: brokers,
+		topic:   string(topic),
+		opts:    opts,
+		log:     opts.log.Prefix(fmt.Sprintf("View %s", topic)),
+		state:   newViewSignal(),
 	}
 
 	return v, err
@@ -105,19 +88,9 @@ func (v *View) WaitRunning() <-chan struct{} {
 	return v.state.WaitForState(State(ViewStateRunning))
 }
 
-func (v *View) createPartitions(brokers []string) (rerr error) {
-	tm, err := v.opts.builders.topicmgr(brokers)
-	if err != nil {
-		return fmt.Errorf("Error creating topic manager: %v", err)
-	}
-	defer func() {
-		e := tm.Close()
-		if e != nil && rerr == nil {
-			rerr = fmt.Errorf("Error closing topic manager: %v", e)
-		}
-	}()
+func (v *View) createPartitions(tmgr TopicManager, consumer sarama.Consumer) (rerr error) {
 
-	partitions, err := tm.Partitions(v.topic)
+	partitions, err := tmgr.Partitions(v.topic)
 	if err != nil {
 		return fmt.Errorf("Error getting partitions for topic %s: %v", v.topic, err)
 	}
@@ -136,8 +109,8 @@ func (v *View) createPartitions(brokers []string) (rerr error) {
 		}
 		v.partitions = append(v.partitions, newPartitionTable(v.topic,
 			p,
-			v.consumer,
-			v.tmgr,
+			consumer,
+			tmgr,
 			v.opts.updateCallback,
 			v.opts.builders.storage,
 			v.log.Prefix(fmt.Sprintf("PartTable-%d", partID)),
@@ -231,18 +204,38 @@ func (v *View) Run(ctx context.Context) (rerr error) {
 	v.log.Debugf("starting")
 	defer v.log.Debugf("stopped")
 
+	errs := new(multierr.Errors)
+	defer func() {
+		errs.Collect(rerr)
+		rerr = errs.NilOrError()
+	}()
+
+	consumer, err := v.opts.builders.consumerSarama(v.brokers, v.opts.clientID)
+	if err != nil {
+		return fmt.Errorf("Error creating sarama consumer for brokers %+v: %v", v.brokers, err)
+	}
+
+	defer func() {
+		errs.Collect(consumer.Close())
+	}()
+
+	tmgr, err := v.opts.builders.topicmgr(v.brokers)
+	if err != nil {
+		return fmt.Errorf("Error creating topic manager: %v", err)
+	}
+
+	defer func() {
+		errs.Collect(tmgr.Close())
+	}()
+
+	if err = v.createPartitions(tmgr, consumer); err != nil {
+		return err
+	}
+
 	// update the view state asynchronously by observing
 	// the partition's state and translating that to the view
 	v.runStateMerger(ctx)
 	defer v.state.SetState(State(ViewStateIdle))
-
-	// close the view after running
-	defer func() {
-		errs := new(multierr.Errors)
-		errs.Collect(rerr)
-		errs.Collect(v.close())
-		rerr = errs.NilOrError()
-	}()
 
 	recoverErrg, recoverCtx := multierr.NewErrGroup(ctx)
 
@@ -254,10 +247,9 @@ func (v *View) Run(ctx context.Context) (rerr error) {
 		})
 	}
 
-	err := recoverErrg.Wait().NilOrError()
+	err = recoverErrg.Wait().NilOrError()
 	if err != nil {
-		rerr = fmt.Errorf("Error recovering partitions for view %s: %v", v.Topic(), err)
-		return
+		return fmt.Errorf("Error recovering partitions for view %s: %v", v.Topic(), err)
 	}
 
 	select {

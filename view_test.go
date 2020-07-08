@@ -568,9 +568,9 @@ func TestView_Run(t *testing.T) {
 			oldest int64
 			newest int64 = 10
 			// local     int64          = oldest
-			consumer  = defaultSaramaAutoConsumerMock(t)
-			partition int32
-			count     int64
+			consumer                 = defaultSaramaAutoConsumerMock(t)
+			partition                = int32(0)
+			count                    = int64(0)
 			updateCB  UpdateCallback = func(s storage.Storage, partition int32, key string, value []byte) error {
 				count++
 				return nil
@@ -593,7 +593,8 @@ func TestView_Run(t *testing.T) {
 		pt.consumer = consumer
 		view.partitions = []*PartitionTable{pt}
 		view.state = newViewSignal()
-
+		bm.tmgr.EXPECT().Close()
+		bm.tmgr.EXPECT().Partitions(viewTestTopic).Return([]int32{0}, nil)
 		bm.tmgr.EXPECT().GetOffset(pt.topic, pt.partition, sarama.OffsetOldest).Return(oldest, nil).AnyTimes()
 		bm.tmgr.EXPECT().GetOffset(pt.topic, pt.partition, sarama.OffsetNewest).Return(newest, nil).AnyTimes()
 		partConsumer := consumer.ExpectConsumePartition(viewTestTopic, partition, anyOffset)
@@ -619,7 +620,7 @@ func TestView_Run(t *testing.T) {
 		}()
 
 		ret := view.Run(ctx)
-		test.AssertNil(t, ret)
+		test.AssertNil(t, ret, err)
 	})
 	t.Run("fail", func(t *testing.T) {
 		view, bm, ctrl := createTestView(t, NewMockAutoConsumer(t, DefaultConfig()))
@@ -663,7 +664,8 @@ func TestView_Run(t *testing.T) {
 
 func TestView_createPartitions(t *testing.T) {
 	t.Run("succeed", func(t *testing.T) {
-		view, bm, ctrl := createTestView(t, NewMockAutoConsumer(t, DefaultConfig()))
+		cons := NewMockAutoConsumer(t, DefaultConfig())
+		view, bm, ctrl := createTestView(t, cons)
 		defer ctrl.Finish()
 
 		var (
@@ -672,12 +674,13 @@ func TestView_createPartitions(t *testing.T) {
 		bm.tmgr.EXPECT().Partitions(viewTestTopic).Return([]int32{partition}, nil)
 		bm.tmgr.EXPECT().Close()
 
-		ret := view.createPartitions([]string{""})
+		ret := view.createPartitions(bm.tmgr, cons)
 		test.AssertNil(t, ret)
 		test.AssertTrue(t, len(view.partitions) == 1)
 	})
 	t.Run("fail_tmgr", func(t *testing.T) {
-		view, bm, ctrl := createTestView(t, NewMockAutoConsumer(t, DefaultConfig()))
+		cons := NewMockAutoConsumer(t, DefaultConfig())
+		view, bm, ctrl := createTestView(t, cons)
 		defer ctrl.Finish()
 
 		var (
@@ -686,7 +689,7 @@ func TestView_createPartitions(t *testing.T) {
 		bm.tmgr.EXPECT().Partitions(viewTestTopic).Return(nil, retErr)
 		bm.tmgr.EXPECT().Close()
 
-		ret := view.createPartitions([]string{""})
+		ret := view.createPartitions(bm.tmgr, cons)
 		test.AssertNotNil(t, ret)
 		test.AssertTrue(t, len(view.partitions) == 0)
 	})

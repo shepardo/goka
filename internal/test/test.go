@@ -11,11 +11,11 @@ type Fataler interface {
 	Fatalf(string, ...interface{})
 }
 
-func AssertNil(t Fataler, actual interface{}) {
+func AssertNil(t Fataler, actual interface{}, fields ...interface{}) {
 	value := reflect.ValueOf(actual)
 	if value.IsValid() {
 		if !value.IsNil() {
-			t.Fatalf("Expected value to be nil, but was not nil in %s", string(debug.Stack()))
+			t.Fatalf("Expected value to be nil, but was not nil in %s: %v", string(debug.Stack()), fields)
 		}
 	}
 }
