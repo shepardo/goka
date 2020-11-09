@@ -72,11 +72,11 @@ func (cg *consumerGroup) Consume(ctx context.Context, topics []string, handler s
 		if err != nil {
 			return fmt.Errorf("Error setting up: %v", err)
 		}
-		errg, _ := multierr.NewErrGroup(ctx)
+		errg, innerCtx := multierr.NewErrGroup(ctx)
 		for _, claim := range session.claims {
 			claim := claim
 			errg.Go(func() error {
-				<-ctx.Done()
+				<-innerCtx.Done()
 				claim.close()
 				return nil
 			})
