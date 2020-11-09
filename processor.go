@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -545,10 +546,12 @@ func (g *Processor) ConsumeClaim(session sarama.ConsumerGroupSession, claim sara
 			select {
 			case part.input <- msg:
 			case err := <-errors:
+				log.Printf("inner processor error: %v", err)
 				return err
 			}
 
 		case err := <-errors:
+			log.Printf("inner processor error2: %v", err)
 			return err
 		}
 	}

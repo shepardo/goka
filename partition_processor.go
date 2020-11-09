@@ -155,7 +155,7 @@ func (pp *PartitionProcessor) Recovered() bool {
 	return pp.state.IsState(PPStateRunning)
 }
 
-// Errors returns a channel or errors during consumption
+// Errors returns a channel of errors during consumption
 func (pp *PartitionProcessor) Errors() <-chan error {
 	errs := make(chan error)
 
