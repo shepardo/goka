@@ -48,7 +48,8 @@ type PartitionProcessor struct {
 	// runnerErrors store the errors occuring during runtime of the
 	// partition processor. It is created in Setup and after the runnerGroup
 	// finishes.
-	runnerErrors chan error
+	runnerErrors <-chan error
+
 
 	consumer sarama.Consumer
 	tmgr     TopicManager
@@ -168,9 +169,10 @@ func (pp *PartitionProcessor) Errors() <-chan error {
 func (pp *PartitionProcessor) Setup(ctx context.Context) error {
 	ctx, pp.cancelRunnerGroup = context.WithCancel(ctx)
 
-	var runnerCtx context.Context
-	pp.runnerGroup, runnerCtx = multierr.NewErrGroup(ctx)
-	pp.runnerErrors = make(chan error)
+	runnerGroup, runnerCtx := multierr.NewErrGroup(ctx)
+	runnerErrors := make(chan error)
+	pp.runnerErrors = runnerErrors
+	pp.runnerGroup = runnerGroup
 
 	setupErrg, setupCtx := multierr.NewErrGroup(ctx)
 
@@ -211,29 +213,32 @@ func (pp *PartitionProcessor) Setup(ctx context.Context) error {
 		return fmt.Errorf("Setup failed. Cannot start processor for partition %d: %v", pp.partition, err)
 	}
 
+	// we have a race condition here as the runnerGroup is accessed from Setup and Stop concurrently if the processor
+	// is stopped during startup. Either way, we must ensure that error catching from setup/running using the channel
+	// is thread safe
+	go func() {
+		defer close(runnerErrors)
+		err := runnerGroup.Wait().NilOrError()
+		if err != nil {
+			runnerErrors <- err
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
 		return nil
 	default:
 	}
 
-	go func() {
-		defer close(pp.runnerErrors)
-		err := pp.runnerGroup.Wait().NilOrError()
-		if err != nil {
-			pp.runnerErrors <- err
-		}
-	}()
-
 	for _, join := range pp.joins {
 		join := join
-		pp.runnerGroup.Go(func() error {
+		runnerGroup.Go(func() error {
 			return join.CatchupForever(runnerCtx, false)
 		})
 	}
 
 	// now run the processor in a runner-group
-	pp.runnerGroup.Go(func() error {
+	runnerGroup.Go(func() error {
 		err := pp.run(runnerCtx)
 		if err != nil {
 			pp.log.Debugf("Run failed with error: %v", err)
