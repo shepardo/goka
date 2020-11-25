@@ -264,9 +264,6 @@ func (pp *PartitionProcessor) Stop() error {
 	pp.log.Debugf("Stopping")
 	defer pp.log.Debugf("... Stopping done")
 
-	pp.mStartStop.RLock()
-	defer pp.mStartStop.RUnlock()
-
 	pp.state.SetState(PPStateStopping)
 	defer pp.state.SetState(PPStateIdle)
 	errs := new(multierr.Errors)
