@@ -43,13 +43,13 @@ type PartitionProcessor struct {
 	input       chan *sarama.ConsumerMessage
 	inputTopics []string
 
+	mStartStop        sync.RWMutex
 	runnerGroup       *multierr.ErrGroup
 	cancelRunnerGroup func()
 	// runnerErrors store the errors occuring during runtime of the
 	// partition processor. It is created in Setup and after the runnerGroup
 	// finishes.
-	runnerErrors <-chan error
-
+	runnerErrors chan error
 
 	consumer sarama.Consumer
 	tmgr     TopicManager
@@ -162,17 +162,21 @@ func (pp *PartitionProcessor) Recovered() bool {
 
 // Errors returns a channel of errors during consumption
 func (pp *PartitionProcessor) Errors() <-chan error {
+	pp.mStartStop.RLock()
+	defer pp.mStartStop.RUnlock()
 	return pp.runnerErrors
 }
 
 // Setup initializes the processor after a rebalance
 func (pp *PartitionProcessor) Setup(ctx context.Context) error {
-	ctx, pp.cancelRunnerGroup = context.WithCancel(ctx)
+	pp.mStartStop.Lock()
+	defer pp.mStartStop.Unlock()
 
-	runnerGroup, runnerCtx := multierr.NewErrGroup(ctx)
-	runnerErrors := make(chan error)
-	pp.runnerErrors = runnerErrors
-	pp.runnerGroup = runnerGroup
+	ctx, pp.cancelRunnerGroup = context.WithCancel(ctx)
+	var runnerCtx context.Context
+
+	pp.runnerGroup, runnerCtx = multierr.NewErrGroup(ctx)
+	pp.runnerErrors = make(chan error)
 
 	setupErrg, setupCtx := multierr.NewErrGroup(ctx)
 
@@ -213,17 +217,6 @@ func (pp *PartitionProcessor) Setup(ctx context.Context) error {
 		return fmt.Errorf("Setup failed. Cannot start processor for partition %d: %v", pp.partition, err)
 	}
 
-	// we have a race condition here as the runnerGroup is accessed from Setup and Stop concurrently if the processor
-	// is stopped during startup. Either way, we must ensure that error catching from setup/running using the channel
-	// is thread safe
-	go func() {
-		defer close(runnerErrors)
-		err := runnerGroup.Wait().NilOrError()
-		if err != nil {
-			runnerErrors <- err
-		}
-	}()
-
 	select {
 	case <-ctx.Done():
 		return nil
@@ -232,19 +225,36 @@ func (pp *PartitionProcessor) Setup(ctx context.Context) error {
 
 	for _, join := range pp.joins {
 		join := join
-		runnerGroup.Go(func() error {
+		pp.runnerGroup.Go(func() error {
 			return join.CatchupForever(runnerCtx, false)
 		})
 	}
 
 	// now run the processor in a runner-group
-	runnerGroup.Go(func() error {
+	pp.runnerGroup.Go(func() error {
 		err := pp.run(runnerCtx)
 		if err != nil {
 			pp.log.Debugf("Run failed with error: %v", err)
 		}
 		return err
 	})
+
+	go func() {
+
+		// wait until the runner is done (read-locking)
+		pp.mStartStop.RLock()
+		err := pp.runnerGroup.Wait().NilOrError()
+		pp.mStartStop.RUnlock()
+
+		// now we're modifying the runner errors channel and need a write lock
+		pp.mStartStop.Lock()
+		if err != nil {
+			pp.runnerErrors <- err
+		}
+		close(pp.runnerErrors)
+		pp.mStartStop.Unlock()
+	}()
+
 	return nil
 }
 
@@ -252,6 +262,10 @@ func (pp *PartitionProcessor) Setup(ctx context.Context) error {
 func (pp *PartitionProcessor) Stop() error {
 	pp.log.Debugf("Stopping")
 	defer pp.log.Debugf("... Stopping done")
+
+	pp.mStartStop.RLock()
+	defer pp.mStartStop.RUnlock()
+
 	pp.state.SetState(PPStateStopping)
 	defer pp.state.SetState(PPStateIdle)
 	errs := new(multierr.Errors)
