@@ -176,7 +176,6 @@ func (pp *PartitionProcessor) Setup(ctx context.Context) error {
 	var runnerCtx context.Context
 
 	pp.runnerGroup, runnerCtx = multierr.NewErrGroup(ctx)
-	pp.runnerErrors = make(chan error)
 
 	setupErrg, setupCtx := multierr.NewErrGroup(ctx)
 
@@ -238,6 +237,8 @@ func (pp *PartitionProcessor) Setup(ctx context.Context) error {
 		}
 		return err
 	})
+
+	pp.runnerErrors = make(chan error)
 
 	go func() {
 

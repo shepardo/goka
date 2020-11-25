@@ -3,7 +3,9 @@ package multierr
 import (
 	"context"
 	"fmt"
+	"log"
 	"testing"
+	"time"
 
 	"github.com/lovoo/goka/internal/test"
 )
@@ -41,4 +43,22 @@ func TestErrGroup_Go(t *testing.T) {
 	test.AssertStringContains(t, err.Error(), "some error2")
 	test.AssertNotNil(t, ctx.Err())
 	test.AssertStringContains(t, ctx.Err().Error(), "context canceled")
+}
+
+func TestErrGroup_Empty(t *testing.T) {
+	g, _ := NewErrGroup(context.Background())
+
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		g.Wait()
+	}()
+
+	select {
+	case <-time.NewTimer(10 * time.Millisecond).C:
+		t.Fatalf("waiting for errgroup timed out")
+	case <-waitDone:
+		log.Printf("wait done")
+		// ok
+	}
 }
