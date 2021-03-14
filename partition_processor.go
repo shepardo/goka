@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
-	"github.com/lovoo/goka/logger"
 	"github.com/lovoo/goka/multierr"
 )
 
@@ -29,7 +28,7 @@ const (
 type PartitionProcessor struct {
 	callbacks map[string]ProcessCallback
 
-	log logger.Logger
+	log logger
 
 	table   *PartitionTable
 	joins   map[string]*PartitionTable
@@ -68,7 +67,7 @@ type PartitionProcessor struct {
 func newPartitionProcessor(partition int32,
 	graph *GroupGraph,
 	session sarama.ConsumerGroupSession,
-	logger logger.Logger,
+	logger logger,
 	opts *poptions,
 	lookupTables map[string]*View,
 	consumer sarama.Consumer,

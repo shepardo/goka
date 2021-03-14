@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
-	"github.com/lovoo/goka/logger"
 	"github.com/lovoo/goka/storage"
 )
 
@@ -75,7 +74,7 @@ type ProcessorOption func(*poptions, *GroupGraph)
 
 // processor options
 type poptions struct {
-	log      logger.Logger
+	log      logger
 	clientID string
 
 	updateCallback       UpdateCallback
@@ -163,9 +162,13 @@ func WithPartitionChannelSize(size int) ProcessorOption {
 
 // WithLogger sets the logger the processor should use. By default, processors
 // use the standard library logger.
-func WithLogger(log logger.Logger) ProcessorOption {
+func WithLogger(l Logger) ProcessorOption {
 	return func(o *poptions, gg *GroupGraph) {
-		o.log = log
+		if prefixLogger, ok := l.(logger); ok {
+			o.log = prefixLogger
+		} else {
+			o.log = wrapLogger(l)
+		}
 	}
 }
 
@@ -241,7 +244,7 @@ func WithTester(t Tester) ProcessorOption {
 
 func (opt *poptions) applyOptions(gg *GroupGraph, opts ...ProcessorOption) error {
 	opt.clientID = defaultClientID
-	opt.log = logger.Default()
+	opt.log = defaultLogger
 	opt.hasher = DefaultHasher()
 	opt.backoffResetTime = defaultBackoffRestTime
 
@@ -297,7 +300,7 @@ func WithRebalanceCallback(cb RebalanceCallback) ProcessorOption {
 type ViewOption func(*voptions, Table, Codec)
 
 type voptions struct {
-	log              logger.Logger
+	log              logger
 	clientID         string
 	tableCodec       Codec
 	updateCallback   UpdateCallback
@@ -315,9 +318,13 @@ type voptions struct {
 
 // WithViewLogger sets the logger the view should use. By default, views
 // use the standard library logger.
-func WithViewLogger(log logger.Logger) ViewOption {
+func WithViewLogger(l Logger) ViewOption {
 	return func(o *voptions, table Table, codec Codec) {
-		o.log = log
+		if prefixLogger, ok := l.(logger); ok {
+			o.log = prefixLogger
+		} else {
+			o.log = wrapLogger(l)
+		}
 	}
 }
 
@@ -408,7 +415,7 @@ func WithViewTester(t Tester) ViewOption {
 
 func (opt *voptions) applyOptions(topic Table, codec Codec, opts ...ViewOption) error {
 	opt.clientID = defaultClientID
-	opt.log = logger.Default()
+	opt.log = defaultLogger
 	opt.hasher = DefaultHasher()
 	opt.backoffResetTime = defaultBackoffRestTime
 
@@ -446,7 +453,7 @@ type EmitterOption func(*eoptions, Stream, Codec)
 
 // emitter options
 type eoptions struct {
-	log      logger.Logger
+	log      logger
 	clientID string
 
 	hasher func() hash.Hash32
@@ -459,9 +466,13 @@ type eoptions struct {
 
 // WithEmitterLogger sets the logger the emitter should use. By default,
 // emitters use the standard library logger.
-func WithEmitterLogger(log logger.Logger) EmitterOption {
+func WithEmitterLogger(l Logger) EmitterOption {
 	return func(o *eoptions, topic Stream, codec Codec) {
-		o.log = log
+		if prefixLogger, ok := l.(logger); ok {
+			o.log = prefixLogger
+		} else {
+			o.log = wrapLogger(l)
+		}
 	}
 }
 
@@ -504,7 +515,7 @@ func WithEmitterTester(t Tester) EmitterOption {
 }
 func (opt *eoptions) applyOptions(topic Stream, codec Codec, opts ...EmitterOption) {
 	opt.clientID = defaultClientID
-	opt.log = logger.Default()
+	opt.log = defaultLogger
 	opt.hasher = DefaultHasher()
 
 	for _, o := range opts {
