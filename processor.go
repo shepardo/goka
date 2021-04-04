@@ -57,7 +57,7 @@ type Processor struct {
 
 	state *Signal
 
-	ctx    context.Context
+	done   chan struct{}
 	cancel context.CancelFunc
 }
 
@@ -127,6 +127,7 @@ func NewProcessor(brokers []string, gg *GroupGraph, options ...ProcessorOption) 
 		graph: gg,
 
 		state: NewSignal(ProcStateIdle, ProcStateStarting, ProcStateSetup, ProcStateRunning, ProcStateStopping).SetState(ProcStateIdle),
+		done:  make(chan struct{}),
 	}
 
 	return processor, nil
@@ -220,10 +221,17 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 	g.log.Debugf("starting")
 	defer g.log.Debugf("stopped")
 
+	// check if the processor was done already
+	select {
+	case <-g.done:
+		return fmt.Errorf("error running processor: it was already run and terminated. Run can only be called once")
+	default:
+	}
+
 	// create errorgroup
 	ctx, g.cancel = context.WithCancel(ctx)
 	errg, ctx := multierr.NewErrGroup(ctx)
-	g.ctx = ctx
+	defer close(g.done)
 	defer g.cancel()
 
 	// set a starting state. From this point on we know that there's a cancel and a valid context set
@@ -306,7 +314,7 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 		})
 	}
 
-	g.waitForLookupTables()
+	g.waitForStartupTables(ctx)
 
 	// run the main rebalance-consume-loop
 	errg.Go(func() error {
@@ -371,17 +379,74 @@ func (g *Processor) rebalanceLoop(ctx context.Context, consumerGroup sarama.Cons
 	}
 }
 
-func (g *Processor) waitForLookupTables() {
+// waits for all tables that are supposed to start up
+func (g *Processor) waitForStartupTables(ctx context.Context) error {
 
-	// no tables to wait for
-	if len(g.lookupTables) == 0 {
-		return
-	}
-	multiWait := multierr.NewMultiWait(g.ctx, len(g.lookupTables))
+	errg, ctx := multierr.NewErrGroup(ctx)
 
-	// init the multiwait with all
+	var (
+		waitMap  = make(map[string]struct{})
+		mWaitMap sync.Mutex
+	)
+
+	// we'll wait for all lookup tables to have recovered.
+	// For this we're looping through all tables and start
+	// a new goroutine that terminates when the table is done (or ctx is closed).
+	// The extra code adds and removes the table to a map used for logging
+	// the items that the processor is still waiting to recover before ready to go.
 	for _, view := range g.lookupTables {
-		multiWait.Add(view.WaitRunning())
+		view := view
+
+		errg.Go(func() error {
+
+			name := fmt.Sprintf("lookup-table-%s", view.topic)
+			mWaitMap.Lock()
+			waitMap[name] = struct{}{}
+			mWaitMap.Unlock()
+
+			defer func() {
+				mWaitMap.Lock()
+				defer mWaitMap.Unlock()
+				delete(waitMap, name)
+			}()
+
+			select {
+			case <-ctx.Done():
+			case <-view.WaitRunning():
+			}
+			return nil
+		})
+	}
+
+	// If we recover ahead, we'll also start all partition processors once in recover-only-mode
+	// and do the same boilerplate to keep the waitmap up to date.
+	if g.opts.recoverAhead {
+		partitions, err := g.findStatefulPartitions()
+		if err != nil {
+			return fmt.Errorf("error finding dependent partitions: %w", err)
+		}
+		for _, part := range partitions {
+			pproc, err := g.createPartitionProcessor(ctx, part, runModeRecoverOnly, func(msg *sarama.ConsumerMessage, meta string) {
+				panic("a partition processor in recover-only-mode never commits a message")
+			})
+			if err != nil {
+				return fmt.Errorf("Error creating partition processor for recover-ahead %s/%d: %v", g.Graph().Group(), part, err)
+			}
+			errg.Go(func() error {
+				name := fmt.Sprintf("partition-processor-%d", part)
+				mWaitMap.Lock()
+				waitMap[name] = struct{}{}
+				mWaitMap.Unlock()
+
+				defer func() {
+					mWaitMap.Lock()
+					defer mWaitMap.Unlock()
+					delete(waitMap, name)
+				}()
+				return pproc.Start(ctx)
+			})
+		}
+
 	}
 
 	var (
@@ -389,27 +454,64 @@ func (g *Processor) waitForLookupTables() {
 		logTicker = time.NewTicker(1 * time.Minute)
 	)
 
+	// Now run through
 	defer logTicker.Stop()
+	errgWaiter := errg.WaitChan()
 	for {
 		select {
-		case <-g.ctx.Done():
+		// the context has closed, no point in waiting
+		case <-ctx.Done():
 			g.log.Debugf("Stopping to wait for views to get up, context closed")
-			return
-		case <-multiWait.Done():
-			g.log.Debugf("View catchup finished")
-			return
+			return fmt.Errorf("context closed while waiting for startup tables to become ready")
+
+			// the error group is done, which means
+			// * err==nil --> it's done
+			// * err!=nil --> it failed, let's return the error
+		case err := <-errgWaiter:
+			if err == nil {
+				g.log.Debugf("View catchup finished")
+			}
+			return err
+
+		// log the things we're still waiting for
 		case <-logTicker.C:
 			var tablesWaiting []string
-			for topic, view := range g.lookupTables {
-				if !view.Recovered() {
-					tablesWaiting = append(tablesWaiting, topic)
-				}
+			mWaitMap.Lock()
+			for table := range waitMap {
+				tablesWaiting = append(tablesWaiting, table)
 			}
-			g.log.Printf("Waiting for views [%s] to catchup since %.2f minutes",
+			mWaitMap.Unlock()
+
+			g.log.Printf("Waiting for [%s] to start up since %.2f minutes",
 				strings.Join(tablesWaiting, ", "),
 				time.Since(start).Minutes())
 		}
 	}
+}
+
+// find partitions that will any type of local state for this processor.
+// This includes joins and the group-table. If neither are present, it returns an empty list, because
+// it means that the processor is stateless and has only streaming-input.
+// It returns the list of partitions as an error, or empty if there are no such partitions.
+//
+// Supports to pass optional map of excluded partitions if the function is used to determine partitions
+// that are not part of the current assignment
+func (g *Processor) findStatefulPartitions() ([]int32, error) {
+	var (
+		err           error
+		allPartitions []int32
+	)
+	for _, edge := range chainEdges(g.graph.groupTable, g.graph.inputTables) {
+		allPartitions, err = g.tmgr.Partitions(edge.Topic())
+		if err != nil && err != errTopicNotFound {
+			return nil, err
+		}
+		if len(allPartitions) > 0 {
+			break
+		}
+	}
+
+	return allPartitions, err
 }
 
 // Recovered returns whether the processor is running, i.e. if the processor
@@ -469,17 +571,40 @@ func (g *Processor) Setup(session sarama.ConsumerGroupSession) error {
 		g.rebalanceCallback(assignment)
 	}
 
-	// no partitions configured, we cannot setup anything
+	// no partitions configured, just print a log but continue
+	// in case we have configured standby, we should still start the standby-processors
 	if len(assignment) == 0 {
 		g.log.Printf("No partitions assigned. Claims were: %#v. Will probably sleep this generation", session.Claims())
-		return nil
 	}
 	// create partition views for all partitions
 	for partition := range assignment {
 		// create partition processor for our partition
-		err := g.createPartitionProcessor(session.Context(), partition, session)
+		pproc, err := g.createPartitionProcessor(session.Context(), partition, runModeActive, session.MarkMessage)
 		if err != nil {
 			return fmt.Errorf("Error creating partition processor for %s/%d: %v", g.Graph().Group(), partition, err)
+		}
+		g.partitions[partition] = pproc
+	}
+
+	// if hot standby is configured, we find the partitions that are missing
+	// from the current assignment, and create those processors in standby mode
+	if g.opts.hotStandby {
+		allPartitions, err := g.findStatefulPartitions()
+
+		if err != nil {
+			return fmt.Errorf("Error finding partitions for standby")
+		}
+		for _, standby := range allPartitions {
+			// if the partition already exists, it means it is part of the assignment, so we don't
+			// need to keep it on hot-standby and can ignore it.
+			if _, ex := g.partitions[standby]; ex {
+				continue
+			}
+			pproc, err := g.createPartitionProcessor(session.Context(), standby, runModePassive, session.MarkMessage)
+			if err != nil {
+				return fmt.Errorf("Error creating partition processor for %s/%d: %v", g.Graph().Group(), standby, err)
+			}
+			g.partitions[standby] = pproc
 		}
 	}
 
@@ -488,7 +613,7 @@ func (g *Processor) Setup(session sarama.ConsumerGroupSession) error {
 	for _, partition := range g.partitions {
 		pproc := partition
 		errg.Go(func() error {
-			return pproc.Setup(session.Context())
+			return pproc.Start(session.Context())
 		})
 	}
 
@@ -528,14 +653,14 @@ func (g *Processor) WaitForReady() {
 	// wait that the processor is actually running
 	select {
 	case <-g.state.WaitForState(ProcStateRunning):
-	case <-g.ctx.Done():
+	case <-g.done:
 	}
 
 	// wait for all partitionprocessors to be running
 	for _, part := range g.partitions {
 		select {
 		case <-part.state.WaitForState(PPStateRunning):
-		case <-g.ctx.Done():
+		case <-g.done:
 		}
 	}
 }
@@ -625,21 +750,29 @@ func (g *Processor) StatsWithContext(ctx context.Context) *ProcessorStats {
 }
 
 // creates the partition that is responsible for the group processor's table
-func (g *Processor) createPartitionProcessor(ctx context.Context, partition int32, session sarama.ConsumerGroupSession) error {
+func (g *Processor) createPartitionProcessor(ctx context.Context, partition int32, runMode runMode, commit commitCallback) (*PartitionProcessor, error) {
 
 	g.log.Debugf("Creating partition processor for partition %d", partition)
 	if _, has := g.partitions[partition]; has {
-		return fmt.Errorf("processor [%s]: partition %d already exists", g.graph.Group(), partition)
+		return nil, fmt.Errorf("processor [%s]: partition %d already exists", g.graph.Group(), partition)
 	}
 
 	backoff, err := g.opts.builders.backoff()
 	if err != nil {
-		return fmt.Errorf("processor [%s]: could not build backoff handler: %v", g.graph.Group(), err)
+		return nil, fmt.Errorf("processor [%s]: could not build backoff handler: %v", g.graph.Group(), err)
 	}
-	pproc := newPartitionProcessor(partition, g.graph, session, g.log, g.opts, g.lookupTables, g.saramaConsumer, g.producer, g.tmgr, backoff, g.opts.backoffResetTime)
-
-	g.partitions[partition] = pproc
-	return nil
+	return newPartitionProcessor(partition,
+		g.graph,
+		commit,
+		g.log,
+		g.opts,
+		runMode,
+		g.lookupTables,
+		g.saramaConsumer,
+		g.producer,
+		g.tmgr,
+		backoff,
+		g.opts.backoffResetTime), nil
 }
 
 // Stop stops the processor.
