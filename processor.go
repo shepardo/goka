@@ -469,17 +469,34 @@ func (g *Processor) Setup(session sarama.ConsumerGroupSession) error {
 		g.rebalanceCallback(assignment)
 	}
 
-	// no partitions configured, we cannot setup anything
+	// no partitions configured, just print a log but continue
+	// in case we have configured standby, we should still start the standby-processors
 	if len(assignment) == 0 {
 		g.log.Printf("No partitions assigned. Claims were: %#v. Will probably sleep this generation", session.Claims())
-		return nil
 	}
 	// create partition views for all partitions
 	for partition := range assignment {
 		// create partition processor for our partition
-		err := g.createPartitionProcessor(session.Context(), partition, session)
+		pproc, err := g.createPartitionProcessor(session.Context(), partition, runModeActive, session)
 		if err != nil {
 			return fmt.Errorf("Error creating partition processor for %s/%d: %v", g.Graph().Group(), partition, err)
+		}
+		g.partitions[partition] = pproc
+	}
+
+	// if hot standby is configured, we find the partitions that are missing
+	// from the current assignment, and create those processors in standby mode
+	if g.opts.hotStandby {
+		missingPartitions, err := g.findMissingPartitions(assignment)
+		if err != nil {
+			return fmt.Errorf("Error finding partitions for standby")
+		}
+		for _, standby := range missingPartitions {
+			pproc, err := g.createPartitionProcessor(session.Context(), standby, runModePassive, session)
+			if err != nil {
+				return fmt.Errorf("Error creating partition processor for %s/%d: %v", g.Graph().Group(), standby, err)
+			}
+			g.partitions[standby] = pproc
 		}
 	}
 
@@ -488,11 +505,54 @@ func (g *Processor) Setup(session sarama.ConsumerGroupSession) error {
 	for _, partition := range g.partitions {
 		pproc := partition
 		errg.Go(func() error {
-			return pproc.Setup(session.Context())
+			return pproc.Start(session.Context())
 		})
 	}
 
 	return errg.Wait().NilOrError()
+}
+
+// findMissingPartitions is used to determine the partitions that are missing from an
+// assignment from the rest of the processor's partitions.
+//
+// As all inputs/joins and the processor table must be copartitioned, it tries to
+// read the partitions of the first topic that it finds in the group graph or fails with
+// an error otherwise. This case means the group graph is empty, which means the processor is misconfigured
+// and would fail anyway.
+//
+// It returns the list of partitions from the partition-list which are not in the assignment
+func (g *Processor) findMissingPartitions(assignment Assignment) ([]int32, error) {
+	var (
+		topic             string
+		missingPartitions []int32
+	)
+	switch {
+	case len(g.graph.groupTable) > 0:
+		topic = g.graph.GroupTable().Topic()
+	case len(g.graph.inputStreams) > 0:
+		topic = g.graph.inputStreams[0].Topic()
+	case len(g.graph.inputTables) > 0:
+		topic = g.graph.inputTables[0].Topic()
+	}
+
+	if topic == "" {
+		return nil, fmt.Errorf("cannot determine the processor's number of partitions since it seems like it does have neither input nor state")
+	}
+	allPartitions, err := g.tmgr.Partitions(topic)
+	if err != nil {
+		return nil, fmt.Errorf("error getting partitions for topic %s: %v", topic, err)
+	}
+	assignmentMap := make(map[int32]struct{})
+	for part := range assignment {
+		assignmentMap[part] = struct{}{}
+	}
+
+	for _, partition := range allPartitions {
+		if _, is := assignmentMap[partition]; !is {
+			missingPartitions = append(missingPartitions, partition)
+		}
+	}
+	return missingPartitions, nil
 }
 
 // Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
@@ -625,21 +685,29 @@ func (g *Processor) StatsWithContext(ctx context.Context) *ProcessorStats {
 }
 
 // creates the partition that is responsible for the group processor's table
-func (g *Processor) createPartitionProcessor(ctx context.Context, partition int32, session sarama.ConsumerGroupSession) error {
+func (g *Processor) createPartitionProcessor(ctx context.Context, partition int32, runMode runMode, session sarama.ConsumerGroupSession) (*PartitionProcessor, error) {
 
 	g.log.Debugf("Creating partition processor for partition %d", partition)
 	if _, has := g.partitions[partition]; has {
-		return fmt.Errorf("processor [%s]: partition %d already exists", g.graph.Group(), partition)
+		return nil, fmt.Errorf("processor [%s]: partition %d already exists", g.graph.Group(), partition)
 	}
 
 	backoff, err := g.opts.builders.backoff()
 	if err != nil {
-		return fmt.Errorf("processor [%s]: could not build backoff handler: %v", g.graph.Group(), err)
+		return nil, fmt.Errorf("processor [%s]: could not build backoff handler: %v", g.graph.Group(), err)
 	}
-	pproc := newPartitionProcessor(partition, g.graph, session, g.log, g.opts, g.lookupTables, g.saramaConsumer, g.producer, g.tmgr, backoff, g.opts.backoffResetTime)
-
-	g.partitions[partition] = pproc
-	return nil
+	return newPartitionProcessor(partition,
+		g.graph,
+		session,
+		g.log,
+		g.opts,
+		runMode,
+		g.lookupTables,
+		g.saramaConsumer,
+		g.producer,
+		g.tmgr,
+		backoff,
+		g.opts.backoffResetTime), nil
 }
 
 // Stop stops the processor.

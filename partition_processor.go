@@ -23,6 +23,13 @@ const (
 	PPStateStopping
 )
 
+type runMode int
+
+const (
+	runModeActive runMode = iota
+	runModePassive
+)
+
 // PartitionProcessor handles message processing of one partition by serializing
 // messages from different input topics.
 // It also handles joined tables as well as lookup views (managed by `Processor`).
@@ -50,6 +57,8 @@ type PartitionProcessor struct {
 	// finishes.
 	runnerErrors chan error
 
+	runMode runMode
+
 	consumer sarama.Consumer
 	tmgr     TopicManager
 
@@ -70,6 +79,7 @@ func newPartitionProcessor(partition int32,
 	session sarama.ConsumerGroupSession,
 	logger logger.Logger,
 	opts *poptions,
+	runMode runMode,
 	lookupTables map[string]*View,
 	consumer sarama.Consumer,
 	producer Producer,
@@ -130,6 +140,7 @@ func newPartitionProcessor(partition int32,
 		updateStats:     make(chan func(), 10),
 		cancelStatsLoop: cancel,
 		session:         session,
+		runMode:         runMode,
 	}
 
 	go partProc.runStatsLoop(statsLoopCtx)
@@ -164,8 +175,12 @@ func (pp *PartitionProcessor) Errors() <-chan error {
 	return pp.runnerErrors
 }
 
-// Setup initializes the processor after a rebalance
-func (pp *PartitionProcessor) Setup(ctx context.Context) error {
+// Start initializes the partition processor
+// * recover the table
+// * recover all join tables
+// * run the join-tables in catchup mode
+// * start the processor processing loop to receive messages
+func (pp *PartitionProcessor) Start(ctx context.Context) error {
 	ctx, pp.cancelRunnerGroup = context.WithCancel(ctx)
 
 	var runnerCtx context.Context
@@ -235,7 +250,20 @@ func (pp *PartitionProcessor) Setup(ctx context.Context) error {
 
 	// now run the processor in a runner-group
 	pp.runnerGroup.Go(func() error {
-		err := pp.run(runnerCtx)
+		var err error
+		// depending on the run mode, we'll do
+		switch pp.runMode {
+		// (a) start the processor's message run loop so it is ready to receive and process messages
+		case runModeActive:
+			err = pp.run(runnerCtx)
+			// (b) run the processor table in catchup mode so it keeps updating it's state.
+		case runModePassive:
+			if pp.table != nil {
+				err = pp.table.CatchupForever(runnerCtx, false)
+			}
+		default:
+			return fmt.Errorf("processor has invalid run mode")
+		}
 		if err != nil {
 			pp.log.Debugf("Run failed with error: %v", err)
 		}

@@ -84,6 +84,7 @@ type poptions struct {
 	hasher               func() hash.Hash32
 	nilHandling          NilHandling
 	backoffResetTime     time.Duration
+	hotStandby           bool
 
 	builders struct {
 		storage        storage.Builder
@@ -173,6 +174,15 @@ func WithLogger(log logger.Logger) ProcessorOption {
 func WithHasher(hasher func() hash.Hash32) ProcessorOption {
 	return func(o *poptions, gg *GroupGraph) {
 		o.hasher = hasher
+	}
+}
+
+// WithHotStandby configures the processor to keep up partitions that it is not assigned when using
+// multiple processors in a group. This will use more resources, but allows to fail over processors in case of crashes
+// without recovery
+func WithHotStandby() ProcessorOption {
+	return func(o *poptions, gg *GroupGraph) {
+		o.hotStandby = true
 	}
 }
 
