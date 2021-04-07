@@ -23,11 +23,15 @@ const (
 	PPStateStopping
 )
 
+// runMode configures how the partition processor participates as part of the processor
 type runMode int
 
 const (
+	// default mode: the processor recovers once and consumes messages
 	runModeActive runMode = iota
+	// the processor keeps recovering. This is used for hot standby.
 	runModePassive
+	// the processor only recovers once and then stops. This is used for recover-ahead-option
 	runModeRecoverOnly
 )
 

@@ -2,6 +2,7 @@ package systemtest
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,6 +38,7 @@ func hashKey(key string, numPartitions int) int32 {
 }
 
 type storageTracker struct {
+	sync.Mutex
 	storages map[string]storage.Storage
 }
 
@@ -47,6 +49,8 @@ func newStorageTracker() *storageTracker {
 }
 
 func (st *storageTracker) Build(topic string, partition int32) (storage.Storage, error) {
+	st.Lock()
+	defer st.Unlock()
 	key := st.key(topic, partition)
 	if existing, ok := st.storages[key]; ok {
 		return existing, nil
