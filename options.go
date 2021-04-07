@@ -85,6 +85,7 @@ type poptions struct {
 	nilHandling          NilHandling
 	backoffResetTime     time.Duration
 	hotStandby           bool
+	recoverAhead         bool
 
 	builders struct {
 		storage        storage.Builder
@@ -179,10 +180,21 @@ func WithHasher(hasher func() hash.Hash32) ProcessorOption {
 
 // WithHotStandby configures the processor to keep up partitions that it is not assigned when using
 // multiple processors in a group. This will use more resources, but allows to fail over processors in case of crashes
-// without recovery
+// without recovery.
+// Use in combination to `WithRecoverAhead` to avoid unnecessary delays.
 func WithHotStandby() ProcessorOption {
 	return func(o *poptions, gg *GroupGraph) {
 		o.hotStandby = true
+	}
+}
+
+// WithRecoverAhead configures the processor to recover all joins and the processor table ahead
+// of joining the group. This reduces the processing delay that occurs when adding new instances to
+// groups with high-volume-joins/tables.
+// Use in combination to `WithHotStandby` to avoid unnecessary delays.
+func WithRecoverAhead() ProcessorOption {
+	return func(o *poptions, gg *GroupGraph) {
+		o.recoverAhead = true
 	}
 }
 

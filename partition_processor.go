@@ -28,7 +28,10 @@ type runMode int
 const (
 	runModeActive runMode = iota
 	runModePassive
+	runModeRecoverOnly
 )
+
+type commitCallback func(msg *sarama.ConsumerMessage, meta string)
 
 // PartitionProcessor handles message processing of one partition by serializing
 // messages from different input topics.
@@ -68,7 +71,7 @@ type PartitionProcessor struct {
 	updateStats     chan func()
 	cancelStatsLoop context.CancelFunc
 
-	session  sarama.ConsumerGroupSession
+	commit   commitCallback
 	producer Producer
 
 	opts *poptions
@@ -76,7 +79,7 @@ type PartitionProcessor struct {
 
 func newPartitionProcessor(partition int32,
 	graph *GroupGraph,
-	session sarama.ConsumerGroupSession,
+	commit commitCallback,
 	logger logger.Logger,
 	opts *poptions,
 	runMode runMode,
@@ -139,7 +142,7 @@ func newPartitionProcessor(partition int32,
 		responseStats:   make(chan *PartitionProcStats, 1),
 		updateStats:     make(chan func(), 10),
 		cancelStatsLoop: cancel,
-		session:         session,
+		commit:          commit,
 		runMode:         runMode,
 	}
 
@@ -239,6 +242,13 @@ func (pp *PartitionProcessor) Start(ctx context.Context) error {
 	case <-ctx.Done():
 		return nil
 	default:
+	}
+
+	// at this point, we have successfully recovered all joins and the table of the partition-processor.
+	// If the partition-processor was started to do only that (e.g. for group-recover-ahead), we
+	// will return here
+	if pp.runMode == runModeRecoverOnly {
+		return nil
 	}
 
 	for _, join := range pp.joins {
@@ -517,7 +527,7 @@ func (pp *PartitionProcessor) processMessage(ctx context.Context, wg *sync.WaitG
 		trackOutputStats: pp.enqueueTrackOutputStats,
 		pviews:           pp.joins,
 		views:            pp.lookups,
-		commit:           func() { pp.session.MarkMessage(msg, "") },
+		commit:           func() { pp.commit(msg, "") },
 		wg:               wg,
 		msg:              msg,
 		syncFailer:       syncFailer,
@@ -536,7 +546,7 @@ func (pp *PartitionProcessor) processMessage(ctx context.Context, wg *sync.WaitG
 	case msg.Value == nil && pp.opts.nilHandling == NilIgnore:
 		// mark the message upstream so we don't receive it again.
 		// this is usually only an edge case in unit tests, as kafka probably never sends us nil messages
-		pp.session.MarkMessage(msg, "")
+		pp.commit(msg, "")
 		// otherwise drop it.
 		return nil
 	case msg.Value == nil && pp.opts.nilHandling == NilProcess:

@@ -21,6 +21,15 @@ func (g *ErrGroup) Wait() *Errors {
 	return &g.err
 }
 
+func (g *ErrGroup) WaitChan() <-chan *Errors {
+	errs := make(chan *Errors, 1)
+	go func() {
+		defer close(errs)
+		errs <- g.Wait()
+	}()
+	return errs
+}
+
 func (g *ErrGroup) Go(f func() error) {
 	g.Group.Go(func() error {
 		if err := f(); err != nil {
