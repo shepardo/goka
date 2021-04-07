@@ -414,7 +414,7 @@ func (g *Processor) waitForStartupTables(ctx context.Context) error {
 	}
 
 	if g.opts.recoverAhead {
-		partitions, err := g.findDependentPartitions(nil)
+		partitions, err := g.findStatefulPartitions()
 		if err != nil {
 			return fmt.Errorf("error finding dependent partitions: %w", err)
 		}
@@ -461,12 +461,14 @@ func (g *Processor) waitForStartupTables(ctx context.Context) error {
 	}
 }
 
-// find partitions that might need recovery/hot standby.
+// find partitions that will any type of local state for this processor.
 // This includes joins and the group-table. If neither are present, it returns an empty list, because
 // it means that the processor is stateless and has only streaming-input.
-// Supports an optional map of excluded partitions if the function is used to determine partitions
-// that are NOT part of the current assignment to be kept in sync for hot-standby.
-func (g *Processor) findDependentPartitions(excluded map[int32]struct{}) ([]int32, error) {
+// It returns the list of partitions as an error, or empty if there are no such partitions.
+//
+// Supports to pass optional map of excluded partitions if the function is used to determine partitions
+// that are not part of the current assignment
+func (g *Processor) findStatefulPartitions() ([]int32, error) {
 	var (
 		err           error
 		allPartitions []int32
@@ -481,14 +483,7 @@ func (g *Processor) findDependentPartitions(excluded map[int32]struct{}) ([]int3
 		}
 	}
 
-	var partitions []int32
-	for _, part := range allPartitions {
-		if _, ex := excluded[part]; ex {
-			continue
-		}
-		partitions = append(partitions, part)
-	}
-	return partitions, err
+	return allPartitions, err
 }
 
 // Recovered returns whether the processor is running, i.e. if the processor
@@ -566,15 +561,17 @@ func (g *Processor) Setup(session sarama.ConsumerGroupSession) error {
 	// if hot standby is configured, we find the partitions that are missing
 	// from the current assignment, and create those processors in standby mode
 	if g.opts.hotStandby {
-		excludedFromStandby := make(map[int32]struct{})
-		for part := range assignment {
-			excludedFromStandby[part] = struct{}{}
-		}
-		missingPartitions, err := g.findDependentPartitions(excludedFromStandby)
+		allPartitions, err := g.findStatefulPartitions()
+
 		if err != nil {
 			return fmt.Errorf("Error finding partitions for standby")
 		}
-		for _, standby := range missingPartitions {
+		for _, standby := range allPartitions {
+			// if the partition already exists, it means it is part of the assignment, so we don't
+			// need to keep it on hot-standby and can ignore it.
+			if _, ex := g.partitions[standby]; ex {
+				continue
+			}
 			pproc, err := g.createPartitionProcessor(session.Context(), standby, runModePassive, session.MarkMessage)
 			if err != nil {
 				return fmt.Errorf("Error creating partition processor for %s/%d: %v", g.Graph().Group(), standby, err)
